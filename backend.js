@@ -3,6 +3,11 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
+// ═══════════════════════════════════════════
+// Chat-C v1.0.0 — 2026-07-01
+// ═══════════════════════════════════════════
+const __VERSION__ = 'v1.0.0';
+
 const app = express();
 const PORT = process.env.PORT || 4567;
 
@@ -1142,6 +1147,7 @@ app.get('/api/splash', (req, res) => {
 // === 启动 ===
 app.listen(PORT, '0.0.0.0', () => {
   console.log('');
+  console.log(`  🧡 Chat-C ${__VERSION__}`);
   console.log('  🚀 Claude Chat Server');
   console.log(`  Frontend:  http://localhost:${PORT}`);
   console.log(`  Backend:   http://localhost:${PORT}/api`);

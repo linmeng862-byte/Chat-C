@@ -558,7 +558,7 @@ const logo=(cls='mark-20')=>`<svg class="brand-mark ${cls}"><use href="#claude-m
 document.querySelectorAll('[data-icon]').forEach(el=>{el.innerHTML=icon(el.dataset.icon)});
 document.querySelectorAll('[data-context-icon]').forEach(el=>{el.innerHTML=icon(el.dataset.contextIcon)});
 window.__sidebarBuild='round97-phosphor-all';
-const state={token:localStorage.getItem('chat_token')||null,convId:localStorage.getItem('chat_conversation')||null,legacySessionId:null,currentTitle:'新对话',starred:false,model:localStorage.getItem('chat_model')||'claude-sonnet-4-6',settings:JSON.parse(localStorage.getItem('chat_model_settings')||'{}'),busy:false,pendingFiles:[],models:[],menuSession:null,profile:{},projectId:null,abortController:null,_historyHasMore:false,_oldestMessageId:null,_loadedMessages:null};
+const state={__VERSION__:'v1.0.0',token:localStorage.getItem('chat_token')||null,convId:localStorage.getItem('chat_conversation')||null,legacySessionId:null,currentTitle:'新对话',starred:false,model:localStorage.getItem('chat_model')||'claude-sonnet-4-6',settings:JSON.parse(localStorage.getItem('chat_model_settings')||'{}'),busy:false,pendingFiles:[],models:[],menuSession:null,profile:{},projectId:null,abortController:null,_historyHasMore:false,_oldestMessageId:null,_loadedMessages:null};
 const chat=$('chat'),stream=$('stream'),streamInner=$('streamInner'),input=$('input'),send=$('send');
 function drawerDebugUpdate(){}
 $('openDrawer').innerHTML=icon('menu');
