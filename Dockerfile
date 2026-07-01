@@ -4,8 +4,8 @@ WORKDIR /app
 # better-sqlite3 需要编译工具
 RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
 
-COPY package*.json ./
-RUN npm ci --omit=dev
+COPY package.json ./
+RUN npm install --omit=dev
 COPY . .
 RUN mkdir -p data/uploads data/projects data/uploads/tmp
 
