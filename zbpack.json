@@ -1,0 +1,6 @@
+{
+  "build_command": "npm install",
+  "start_command": "node backend.js",
+  "install_command": "apt-get update && apt-get install -y python3 make g++ && npm install",
+  "build_mode": "docker"
+}
