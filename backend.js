@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 
 const app = express();
-const PORT = 4567;
+const PORT = process.env.PORT || 4567;
 
 // === 数据库初始化 ===
 const db = new Database(path.join(__dirname, 'data', 'claude.db'));
@@ -118,7 +118,7 @@ app.get('/api/auth/ombre', auth, (req, res) => {
 });
 
 // === 认证 ===
-const AUTH_TOKEN = 'claude-chat-' + Date.now().toString(36);
+const AUTH_TOKEN = process.env.AUTH_TOKEN || 'claude-chat-' + Date.now().toString(36);
 
 // 登录（设置中转站配置）
 app.post('/api/auth', (req, res) => {
