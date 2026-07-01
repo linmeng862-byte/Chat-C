@@ -1,15 +1,15 @@
 {
-  "name": "claude",
+  "name": "chat-c",
   "version": "1.0.0",
-  "description": "",
-  "main": "add-mock.js",
+  "description": "Claude Chat - full-featured chat frontend with relay API support",
+  "main": "backend.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node backend.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "MIT",
   "type": "commonjs",
   "dependencies": {
     "better-sqlite3": "^12.11.1",
