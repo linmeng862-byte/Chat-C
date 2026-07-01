@@ -694,12 +694,8 @@ app.post('/api/chat', auth, async (req, res) => {
 async function handleAnthropicChat(req, res, ctx) {
   const { baseUrl, apiKey, model, history, systemPrompt, thinkingConfig, convId } = ctx;
 
-  // 智能拼接 endpoint：避免 base_url 已含路径时重复
-  let endpoint = baseUrl.replace(/\/+$/, '');
-  if (endpoint.endsWith('/v1/messages')) { /* 已完整，直接用 */ }
-  else if (endpoint.endsWith('/v1')) { endpoint += '/messages'; }
-  else if (endpoint.includes('/v1/')) { /* base_url 含 /v1/ 但不是 /v1/messages，如 /v1/chat → 不改 */ endpoint += '/messages'; }
-  else { endpoint += '/v1/messages'; }
+  // 用户填完整 Endpoint，直接透传（不拼接）
+  const endpoint = baseUrl.replace(/\/+$/, '');
 
   const requestBody = {
     model,
@@ -945,10 +941,8 @@ async function handleAnthropicChat(req, res, ctx) {
 async function handleOpenAIChat(req, res, ctx) {
   const { baseUrl, apiKey, model, history, systemPrompt, convId } = ctx;
 
-  // 智能拼接 endpoint
-  let endpoint = baseUrl.replace(/\/+$/, '');
-  if (!endpoint.includes('/v1/')) endpoint += '/v1/chat/completions';
-  else if (!endpoint.includes('/chat/completions')) endpoint += '/chat/completions';
+  // 用户填完整 Endpoint，直接透传（不拼接）
+  const endpoint = baseUrl.replace(/\/+$/, '');
 
   // 转换 history 为 OpenAI messages 格式
   const messages = [
