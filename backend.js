@@ -1,0 +1,1149 @@
+const express = require('express');
+const Database = require('better-sqlite3');
+const path = require('path');
+const fs = require('fs');
+
+const app = express();
+const PORT = 4567;
+
+// === 数据库初始化 ===
+const db = new Database(path.join(__dirname, 'data', 'claude.db'));
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS sessions (
+    conv_id TEXT PRIMARY KEY,
+    title TEXT DEFAULT '新对话',
+    starred INTEGER DEFAULT 0,
+    project_id TEXT DEFAULT NULL,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conv_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    content TEXT DEFAULT '',
+    thinking TEXT DEFAULT '',
+    attachments TEXT DEFAULT '[]',
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (conv_id) REFERENCES sessions(conv_id) ON DELETE CASCADE
+  );
+  CREATE TABLE IF NOT EXISTS profile (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS saved_memories (
+    id TEXT PRIMARY KEY,
+    content TEXT NOT NULL,
+    enabled INTEGER DEFAULT 1,
+    source TEXT DEFAULT 'manual',
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+  CREATE TABLE IF NOT EXISTS diary (
+    date TEXT PRIMARY KEY,
+    content TEXT DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+  CREATE TABLE IF NOT EXISTS uploads (
+    id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    path TEXT NOT NULL,
+    size INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+  CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+  CREATE TABLE IF NOT EXISTS project_files (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content TEXT DEFAULT '',
+    size INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
+  );
+`);
+
+// 迁移：为已有 sessions 表添加 project_id 列
+try { db.exec('ALTER TABLE sessions ADD COLUMN project_id TEXT DEFAULT NULL'); } catch(e) { /* 列已存在，忽略 */ }
+
+// 确保上传目录存在
+const uploadDir = path.join(__dirname, 'data', 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+const projectDir = path.join(__dirname, 'data', 'projects');
+if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
+
+const multer = require('multer');
+const upload = multer({ dest: path.join(__dirname, 'data', 'uploads', 'tmp'), limits: { fileSize: 20 * 1024 * 1024 } });
+
+// === 中间件 ===
+app.use(express.json({ limit: '50mb' }));
+app.use(express.static(path.join(__dirname, 'static'), {
+  etag: false,
+  maxAge: 0,
+  setHeaders: (res, filePath) => {
+    res.setHeader('Cache-Control', 'no-store');
+    if (filePath.endsWith('.css')) res.setHeader('Content-Type', 'text/css');
+    if (filePath.endsWith('.js')) res.setHeader('Content-Type', 'application/javascript');
+    if (filePath.endsWith('.svg')) res.setHeader('Content-Type', 'image/svg+xml');
+  }
+}));
+
+// === Ombre Brain 密码配置 ===
+app.post('/api/auth/ombre', auth, (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ detail: '需要密码' });
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('ombre_password', ?)").run(password);
+  // 清除旧 session 让下次重新登录
+  setOmbreCookie('');
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/ombre', auth, (req, res) => {
+  const hasPassword = !!getOmbrePassword();
+  res.json({ configured: hasPassword, url: OMBRE_BRAIN_URL });
+});
+
+// === 认证 ===
+const AUTH_TOKEN = 'claude-chat-' + Date.now().toString(36);
+
+// 登录（设置中转站配置）
+app.post('/api/auth', (req, res) => {
+  const { base_url, api_key } = req.body;
+  if (!base_url || !api_key) {
+    return res.status(400).json({ detail: '需要 Base URL 和 API Key' });
+  }
+  // 保存到数据库
+  const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+  upsert.run('base_url', base_url);
+  upsert.run('api_key', api_key);
+  res.json({ token: AUTH_TOKEN });
+});
+
+// 认证中间件
+function auth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (auth !== `Bearer ${AUTH_TOKEN}`) {
+    return res.status(401).json({ detail: '未授权' });
+  }
+  next();
+}
+
+// === 会话管理 ===
+app.get('/api/sessions', auth, (req, res) => {
+  const sessions = db.prepare('SELECT * FROM sessions ORDER BY updated_at DESC').all();
+  res.json({ sessions });
+});
+
+app.post('/api/sessions', auth, (req, res) => {
+  const conv_id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  db.prepare('INSERT INTO sessions (conv_id, title) VALUES (?, ?)').run(conv_id, '新对话');
+  res.json({ conv_id });
+});
+
+app.patch('/api/sessions/:id/title', auth, (req, res) => {
+  const { title } = req.body;
+  db.prepare('UPDATE sessions SET title = ?, updated_at = strftime("%s","now") WHERE conv_id = ?')
+    .run(title, req.params.id);
+  res.json({ ok: true });
+});
+
+app.patch('/api/sessions/:id/star', auth, (req, res) => {
+  const { starred } = req.body;
+  db.prepare('UPDATE sessions SET starred = ?, updated_at = strftime("%s","now") WHERE conv_id = ?')
+    .run(starred ? 1 : 0, req.params.id);
+  res.json({ ok: true });
+});
+
+app.delete('/api/sessions/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM messages WHERE conv_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM sessions WHERE conv_id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// === 消息 ===
+app.get('/api/sessions/:id/messages', auth, (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  const before = req.query.before_id;
+  let query, params;
+  if (before) {
+    query = 'SELECT * FROM messages WHERE conv_id = ? AND id < ? ORDER BY id DESC LIMIT ?';
+    params = [req.params.id, parseInt(before), limit];
+  } else {
+    query = 'SELECT * FROM messages WHERE conv_id = ? ORDER BY id DESC LIMIT ?';
+    params = [req.params.id, limit];
+  }
+  const rows = db.prepare(query).all(...params);
+  const messages = rows.reverse().map(r => ({
+    id: r.id,
+    role: r.role,
+    text: r.content,
+    thinking: r.thinking,
+    attachments: JSON.parse(r.attachments || '[]'),
+    traces: [],
+    timestamp: new Date(r.created_at * 1000).toISOString()
+  }));
+  res.json({
+    messages,
+    has_more: rows.length === limit,
+    next_before_id: rows.length === limit ? rows[rows.length - 1].id : null
+  });
+});
+
+// === 聊天代理（核心） ===
+
+
+// === Ombre Brain 记忆库配置 ===
+const OMBRE_BRAIN_URL = 'https://ye-ombre-brain.zeabur.app';
+// 密码在首次使用时通过 /api/auth/ombre 设置
+function getOmbrePassword() {
+  return db.prepare("SELECT value FROM settings WHERE key = 'ombre_password'").get()?.value || '';
+}
+function getOmbreCookie() {
+  return db.prepare("SELECT value FROM settings WHERE key = 'ombre_session'").get()?.value || '';
+}
+function setOmbreCookie(val) {
+  db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('ombre_session', ?)").run(val);
+}
+
+// === 自定义工具定义 ===
+const TOOLS = [
+  {
+    name: 'get_weather',
+    description: '获取指定城市的天气信息。当用户询问天气时使用此工具。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        city: { type: 'string', description: '城市名称，如"北京"、"Tokyo"、"New York"' }
+      },
+      required: ['city']
+    }
+  },
+  {
+    name: 'get_time',
+    description: '获取当前日期和时间，以及星期几。当用户询问时间、日期、星期时使用此工具。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        timezone: { type: 'string', description: '时区，如"Asia/Shanghai"、"America/New_York"，默认为用户时区' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'search_memory',
+    description: '搜索用户的记忆库。当用户问"你还记得我说过什么"、"我之前提到过"时使用此工具。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索关键词' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'save_note',
+    description: '保存笔记到用户的日记。当用户说"记一下"、"帮我记住"、"写日记"、"save this"时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: '笔记/日记内容' },
+        date: { type: 'string', description: '日期，格式 YYYY-MM-DD，默认为今天' }
+      },
+      required: ['content']
+    }
+  },
+  {
+    name: 'ombre_remember',
+    description: '将重要内容存入 Ombre Brain 记忆库（长期记忆系统）。当用户说"记住这个"、"这个很重要"、"存到记忆库"、"别忘了我说的"时使用。会自动打标签和评估重要度。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        content: { type: 'string', description: '要记忆的内容' },
+        tags: { type: 'string', description: '标签，逗号分隔，如"日常,恋爱,重要"' },
+        importance: { type: 'integer', description: '重要度 1-10，默认7', minimum: 1, maximum: 10 }
+      },
+      required: ['content']
+    }
+  },
+  {
+    name: 'ombre_recall',
+    description: '搜索 Ombre Brain 记忆库。当用户说"你还记得"、"我之前说过"、"回忆一下"、"搜索记忆"时使用。可以找到用户之前保存的所有记忆。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: '搜索关键词' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'ombre_breath',
+    description: '获取当前浮现的记忆（Ombre Brain 的核心功能）。每次打开新对话时自动调用，返回当前最重要的未解决记忆和核心准则。也可以在对话中主动调用。',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'ombre_persona',
+    description: '获取 Claude 对用户的认知卡片。包含用户昵称、性格、偏好、说话方式等认知沉淀。当用户问"你了解我吗"、"你觉得我是什么样的人"时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'ombre_slang',
+    description: '获取用户和 Claude 之间的梗词典/暗语。当对话中出现不理解的特殊用语或暗号时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: []
+    }
+  },
+  {
+    name: 'project_write_file',
+    description: '在指定项目中写入/创建文件。当用户说"写到项目里"、"创建md文件"、"保存到项目"时使用。也可以写记忆文件、笔记等。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        project_name: { type: 'string', description: '项目名称' },
+        filename: { type: 'string', description: '文件名，如 memories.md、notes.md、data.json' },
+        content: { type: 'string', description: '文件内容' }
+      },
+      required: ['project_name', 'filename', 'content']
+    }
+  },
+  {
+    name: 'project_read_file',
+    description: '读取项目中的文件内容。当需要查看项目中已有文件时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        project_name: { type: 'string', description: '项目名称' },
+        filename: { type: 'string', description: '文件名' }
+      },
+      required: ['project_name', 'filename']
+    }
+  },
+  {
+    name: 'project_list_files',
+    description: '列出项目中的所有文件。当用户问项目里有什么文件时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        project_name: { type: 'string', description: '项目名称' }
+      },
+      required: ['project_name']
+    }
+  }
+];
+
+// === 工具执行函数 ===
+
+// 确保 Ombre Brain 有登录 session
+async function ensureOmbreSession() {
+  const existing = getOmbreCookie();
+  if (existing) return existing;
+  
+  const password = getOmbrePassword();
+  if (!password) throw new Error('Ombre Brain 密码未设置，请在侧边栏配置');
+  
+  const r = await fetch(OMBRE_BRAIN_URL + '/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password })
+  });
+  
+  if (!r.ok) throw new Error('Ombre Brain 登录失败');
+  
+  // 从 Set-Cookie 提取 session
+  const setCookie = r.headers.raw?.()?.['set-cookie']?.[0] || r.headers.get('set-cookie') || '';
+  const match = setCookie.match(/ombre_session=([^;]+)/);
+  if (match) {
+    setOmbreCookie('ombre_session=' + match[1]);
+    return 'ombre_session=' + match[1];
+  }
+  throw new Error('Ombre Brain 登录未获取到 session');
+}
+
+
+function writeProjectFile(projectId, filename, content) {
+  // 检查已有文件
+  const existing = db.prepare("SELECT id FROM project_files WHERE project_id = ? AND filename = ?").get(projectId, filename);
+  if (existing) {
+    db.prepare('UPDATE project_files SET content = ?, size = ?, updated_at = strftime("%s","now") WHERE id = ?')
+      .run(content, Buffer.byteLength(content), existing.id);
+  } else {
+    const fid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    db.prepare('INSERT INTO project_files (id, project_id, filename, content, size) VALUES (?, ?, ?, ?, ?)')
+      .run(fid, projectId, filename, content, Buffer.byteLength(content));
+  }
+  // 同步磁盘
+  const filePath = path.join(projectDir, projectId, filename);
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(filePath, content, 'utf8');
+  db.prepare("UPDATE projects SET updated_at = strftime('%s','now') WHERE id = ?").run(projectId);
+  return { saved: true, filename, size: Buffer.byteLength(content) };
+}
+async function executeTool(name, input) {
+  switch (name) {
+    case 'get_weather': {
+      const city = input.city || '北京';
+      try {
+        const url = `https://wttr.in/${encodeURIComponent(city)}?format=j1`;
+        const r = await fetch(url, { headers: { 'User-Agent': 'curl/7.68' } });
+        if (!r.ok) return { error: '无法获取天气数据' };
+        const d = await r.json();
+        const cur = d.current_condition?.[0] || {};
+        const area = d.nearest_area?.[0] || {};
+        return {
+          city: area.areaName?.[0]?.value || city,
+          country: area.country?.[0]?.value || '',
+          temperature: cur.temp_C + '°C',
+          feels_like: cur.FeelsLikeC + '°C',
+          humidity: cur.humidity + '%',
+          weather: cur.weatherDesc?.[0]?.value || cur.lang_zh?.[0]?.value || '',
+          wind: cur.winddir16Point + ' ' + cur.windspeedKmph + 'km/h',
+          observation_time: cur.observation_time || ''
+        };
+      } catch (e) {
+        return { error: '天气查询失败: ' + e.message };
+      }
+    }
+    case 'get_time': {
+      const tz = input.timezone || 'Asia/Shanghai';
+      try {
+        const now = new Date();
+        const opts = { timeZone: tz, hour12: false };
+        const dateStr = now.toLocaleDateString('zh-CN', { ...opts, year: 'numeric', month: '2-digit', day: '2-digit' });
+        const timeStr = now.toLocaleTimeString('zh-CN', opts);
+        const weekday = now.toLocaleDateString('zh-CN', { ...opts, weekday: 'long' });
+        const isoStr = now.toISOString();
+        return { date: dateStr, time: timeStr, weekday, timezone: tz, iso: isoStr };
+      } catch (e) {
+        return { error: '无效时区: ' + tz };
+      }
+    }
+    case 'search_memory': {
+      const query = input.query || '';
+      if (!query) return { results: [] };
+      const like = '%' + query + '%';
+      const memories = db.prepare(
+        "SELECT id, content, source, created_at FROM saved_memories WHERE content LIKE ? ORDER BY created_at DESC LIMIT 10"
+      ).all(like);
+      // 也搜 profile
+      const nickname = db.prepare("SELECT value FROM profile WHERE key = 'nickname'").get()?.value;
+      const fullname = db.prepare("SELECT value FROM profile WHERE key = 'fullName'").get()?.value;
+      const prefs = db.prepare("SELECT value FROM profile WHERE key = 'prefs_content'").get()?.value;
+      const profileInfo = { nickname, fullName: fullname, preferences: prefs };
+      return { memories, profile: profileInfo, query };
+    }
+    case 'save_note': {
+      const content = input.content || '';
+      const date = input.date || new Date().toISOString().slice(0, 10);
+      if (!content) return { error: '内容不能为空' };
+      const existing = db.prepare('SELECT content FROM diary WHERE date = ?').get(date);
+      if (existing) {
+        const merged = existing.content + '\n\n' + content;
+        db.prepare('UPDATE diary SET content = ? WHERE date = ?').run(merged, date);
+        return { saved: true, date, merged: true, content };
+      }
+      db.prepare('INSERT OR REPLACE INTO diary (date, content) VALUES (?, ?)').run(date, content);
+      return { saved: true, date, content };
+    }
+    // === Ombre Brain 工具执行 ===
+    case 'ombre_remember': {
+      const content = input.content || '';
+      if (!content) return { error: '记忆内容不能为空' };
+      try {
+        // 先确保有 session
+        const cookie = await ensureOmbreSession();
+        const r = await fetch(OMBRE_BRAIN_URL + '/api/buckets', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Cookie': cookie },
+          body: JSON.stringify({
+            content,
+            tags: input.tags || '日常',
+            importance: input.importance || 7
+          })
+        });
+        if (!r.ok) {
+          // session 过期了，重新登录
+          if (r.status === 401) {
+            setOmbreCookie('');
+            const cookie2 = await ensureOmbreSession();
+            const r2 = await fetch(OMBRE_BRAIN_URL + '/api/buckets', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Cookie': cookie2 },
+              body: JSON.stringify({ content, tags: input.tags || '日常', importance: input.importance || 7 })
+            });
+            return r2.ok ? await r2.json() : { error: '存储记忆失败' };
+          }
+          return { error: '存储记忆失败: ' + r.status };
+        }
+        return await r.json();
+      } catch (e) {
+        return { error: 'Ombre Brain 连接失败: ' + e.message };
+      }
+    }
+    case 'ombre_recall': {
+      const query = input.query || '';
+      if (!query) return { error: '搜索关键词不能为空' };
+      try {
+        const cookie = await ensureOmbreSession();
+        const r = await fetch(OMBRE_BRAIN_URL + '/api/search?q=' + encodeURIComponent(query), {
+          headers: { 'Cookie': cookie }
+        });
+        if (!r.ok) return { error: '搜索记忆失败: ' + r.status };
+        return await r.json();
+      } catch (e) {
+        return { error: 'Ombre Brain 连接失败: ' + e.message };
+      }
+    }
+    case 'ombre_breath': {
+      try {
+        // breath-hook 不需要认证！
+        const r = await fetch(OMBRE_BRAIN_URL + '/breath-hook');
+        if (!r.ok) return { error: '呼吸失败: ' + r.status };
+        const text = await r.text();
+        return { breath: text };
+      } catch (e) {
+        return { error: 'Ombre Brain 连接失败: ' + e.message };
+      }
+    }
+    case 'ombre_persona': {
+      try {
+        const cookie = await ensureOmbreSession();
+        const r = await fetch(OMBRE_BRAIN_URL + '/api/evolution/persona', {
+          headers: { 'Cookie': cookie }
+        });
+        if (!r.ok) return { error: '获取认知卡片失败' };
+        return await r.json();
+      } catch (e) {
+        return { error: 'Ombre Brain 连接失败: ' + e.message };
+      }
+    }
+    case 'ombre_slang': {
+      try {
+        const cookie = await ensureOmbreSession();
+        const r = await fetch(OMBRE_BRAIN_URL + '/api/evolution/slang', {
+          headers: { 'Cookie': cookie }
+        });
+        if (!r.ok) return { error: '获取梗词典失败' };
+        return await r.json();
+      } catch (e) {
+        return { error: 'Ombre Brain 连接失败: ' + e.message };
+      }
+    }
+    case 'project_write_file': {
+      const pName = input.project_name || '';
+      const filename = input.filename || '';
+      const content = input.content || '';
+      if (!pName || !filename) return { error: '项目名和文件名不能为空' };
+      // 找项目
+      const proj = db.prepare("SELECT * FROM projects WHERE name = ?").get(pName);
+      if (!proj) {
+        // 自动创建项目
+        const newId = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        db.prepare('INSERT INTO projects (id, name, description) VALUES (?, ?, ?)').run(newId, pName, '由AI自动创建');
+        const pDir = path.join(projectDir, newId);
+        if (!fs.existsSync(pDir)) fs.mkdirSync(pDir, { recursive: true });
+        // 写文件
+        return writeProjectFile(newId, filename, content);
+      }
+      return writeProjectFile(proj.id, filename, content);
+    }
+    case 'project_read_file': {
+      const pName = input.project_name || '';
+      const filename = input.filename || '';
+      if (!pName || !filename) return { error: '项目名和文件名不能为空' };
+      const proj = db.prepare("SELECT * FROM projects WHERE name = ?").get(pName);
+      if (!proj) return { error: '项目不存在: ' + pName };
+      const file = db.prepare("SELECT * FROM project_files WHERE project_id = ? AND filename = ?").get(proj.id, filename);
+      if (!file) return { error: '文件不存在: ' + filename };
+      return { filename: file.filename, content: file.content, size: file.size };
+    }
+    case 'project_list_files': {
+      const pName = input.project_name || '';
+      if (!pName) return { error: '项目名不能为空' };
+      const proj = db.prepare("SELECT * FROM projects WHERE name = ?").get(pName);
+      if (!proj) return { error: '项目不存在: ' + pName, projects: db.prepare('SELECT name FROM projects').all() };
+      const files = db.prepare('SELECT id, filename, size, updated_at FROM project_files WHERE project_id = ? ORDER BY filename').all(proj.id);
+      return { project: pName, files };
+    }
+    default:
+      return { error: 'Unknown tool: ' + name };
+  }
+}
+
+app.post('/api/chat', auth, async (req, res) => {
+  const { message, conversation_id, model, effort, extended, attachments, project_id } = req.body;
+
+  // 获取中转站配置
+  const baseUrl = db.prepare("SELECT value FROM settings WHERE key = 'base_url'").get()?.value;
+  const apiKey = db.prepare("SELECT value FROM settings WHERE key = 'api_key'").get()?.value;
+
+  if (!baseUrl || !apiKey) {
+    return res.status(400).json({ detail: '未配置中转站 API' });
+  }
+
+  // 获取会话历史
+  const convId = conversation_id || Date.now().toString(36) + Math.random().toString(36).slice(2);
+  
+  // 如果是新会话，创建
+  const existing = db.prepare('SELECT conv_id FROM sessions WHERE conv_id = ?').get(convId);
+  if (!existing) {
+    db.prepare('INSERT INTO sessions (conv_id, title, project_id) VALUES (?, ?, ?)').run(convId, message.slice(0, 50) || '新对话', project_id || null);
+  }
+
+  // 保存用户消息
+  db.prepare('INSERT INTO messages (conv_id, role, content, attachments) VALUES (?, ?, ?, ?)')
+    .run(convId, 'user', message, JSON.stringify(attachments || []));
+  db.prepare("UPDATE sessions SET updated_at = strftime('%s','now') WHERE conv_id = ?").run(convId);
+
+  // 构建发送给 Anthropic API 的消息历史
+  const history = db.prepare(
+    'SELECT role, content, attachments FROM messages WHERE conv_id = ? ORDER BY id ASC'
+  ).all(convId).map(r => {
+    const atts = JSON.parse(r.attachments || '[]');
+    if (!atts.length) return { role: r.role, content: r.content };
+    // 有附件时用数组格式
+    const contentParts = [];
+    if (r.content) contentParts.push({ type: 'text', text: r.content });
+    atts.forEach(att => {
+      const upload = db.prepare('SELECT * FROM uploads WHERE id = ?').get(att.path || att);
+      if (upload) {
+        const fileData = fs.readFileSync(upload.path);
+        const base64 = fileData.toString('base64');
+        const mediaType = upload.filename.match(/\.(png|jpe?g|gif|webp|svg)$/i)
+          ? 'image/' + (RegExp.$1 === 'jpg' ? 'jpeg' : RegExp.$1.toLowerCase())
+          : 'application/octet-stream';
+        contentParts.push({
+          type: 'image',
+          source: { type: 'base64', media_type: mediaType, data: base64 }
+        });
+      }
+    });
+    return { role: r.role, content: contentParts };
+  });
+
+  // 构建请求体
+  const thinkingConfig = effort === 'extended' || extended
+    ? { type: 'enabled', budget_tokens: 8000 }
+    : undefined;
+
+  // 尝试获取 Ombre Brain 浮现记忆
+  let breathMemory = '';
+  const ombrePassword = getOmbrePassword();
+  if (ombrePassword) {
+    try {
+      const breathRes = await fetch(OMBRE_BRAIN_URL + '/breath-hook');
+      if (breathRes.ok) breathMemory = await breathRes.text();
+    } catch (e) { /* 忽略连接失败 */ }
+  }
+
+  // 尝试获取当前会话关联的 project instructions
+  let projectInstructions = '';
+  const sessionInfo = db.prepare('SELECT project_id FROM sessions WHERE conv_id = ?').get(convId);
+  if (sessionInfo?.project_id) {
+    try {
+      const instrFile = db.prepare("SELECT id, content FROM project_files WHERE project_id = ? AND filename = 'INSTRUCTIONS.md'").get(sessionInfo.project_id);
+      if (instrFile) projectInstructions = instrFile.content;
+    } catch(e) { /* ignore */ }
+  }
+
+  const systemPrompt = "You are a helpful assistant named Claude. Reply in the user's language by default. Be warm, concise, and accurate. You have access to tools - use them when appropriate (e.g., check weather, save notes, search memory, get time, store/recall Ombre Brain memories). Always use tools proactively when the user's request matches a tool's capability." + (breathMemory ? "\n\n---\n[Ombre Brain - 当前浮现的记忆]\n" + breathMemory : "") + (projectInstructions ? "\n\n---\n[Project Instructions]\n" + projectInstructions : "");
+
+  const requestBody = {
+    model: model || 'claude-sonnet-4-6',
+    max_tokens: 8096,
+    stream: true,
+    messages: history,
+    system: systemPrompt,
+    tools: TOOLS,
+  };
+  if (thinkingConfig) requestBody.thinking = thinkingConfig;
+
+  // 代理请求到中转站
+  try {
+    const apiRes = await fetch(baseUrl + '/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    if (!apiRes.ok) {
+      const err = await apiRes.json().catch(() => ({}));
+      return res.status(apiRes.status).json({ detail: err.error?.message || `API 返回 ${apiRes.status}` });
+    }
+
+    // 流式代理 SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    let assistantText = '';
+    let thinkingText = '';
+    const reader = apiRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        
+        // 解析 SSE 事件
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        let currentEvent = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) {
+            currentEvent = line.slice(6).trim();
+          } else if (line.startsWith('data:')) {
+            const rawData = line.slice(5).trim();
+            if (!rawData || rawData === '[DONE]') {
+              res.write('event: done\ndata: {}\n\n');
+              continue;
+            }
+            try {
+              const d = JSON.parse(rawData);
+              
+              // 转换 Anthropic SSE 格式为前端期望的格式
+              if (d.type === 'content_block_start') {
+                currentContentBlockType = d.content_block?.type || '';
+                if (d.content_block?.type === 'thinking') {
+                  res.write('event: thinking\ndata: ' + JSON.stringify({text: ''}) + '\n\n');
+                } else if (d.content_block?.type === 'tool_use') {
+                  currentToolId = d.content_block.id || '';
+                  currentToolName = d.content_block.name || '';
+                  currentToolInput = '';
+                  res.write('event: tool_use\ndata: ' + JSON.stringify({id: currentToolId, name: currentToolName, input: {}}) + '\n\n');
+                }
+              } else if (d.type === 'content_block_delta') {
+                if (d.delta?.type === 'thinking_delta') {
+                  thinkingText += d.delta.thinking || '';
+                  res.write('event: thinking\ndata: ' + JSON.stringify({text: d.delta.thinking || ''}) + '\n\n');
+                } else if (d.delta?.type === 'text_delta') {
+                  assistantText += d.delta.text || '';
+                  res.write('event: delta\ndata: ' + JSON.stringify({text: d.delta.text || ''}) + '\n\n');
+                } else if (d.delta?.type === 'input_json_delta') {
+                  currentToolInput += d.delta.partial_json || '';
+                }
+              } else if (d.type === 'content_block_stop') {
+                if (currentContentBlockType === 'tool_use') {
+                  // 工具调用结束，解析 input
+                  let parsedInput = {};
+                  try { parsedInput = JSON.parse(currentToolInput); } catch(e) { parsedInput = { raw: currentToolInput }; }
+                  toolCalls.push({ id: currentToolId, name: currentToolName, input: parsedInput });
+                }
+                currentContentBlockType = '';
+              } else if (d.type === 'tool_use') {
+                res.write('event: tool_use\ndata: ' + JSON.stringify(d) + '\n\n');
+              } else if (d.type === 'tool_result') {
+                res.write('event: tool_result\ndata: ' + JSON.stringify(d) + '\n\n');
+              } else if (d.type === 'message_start') {
+                const convIdFromApi = d.message?.id;
+                if (convIdFromApi) {
+                  res.write('event: conversation\ndata: ' + JSON.stringify({conversation_id: convIdFromApi}) + '\n\n');
+                }
+              } else if (d.type === 'message_delta') {
+                stopReason = d.delta?.stop_reason || '';
+                if (d.delta?.stop_reason === 'end_turn') {
+                  res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+                }
+                // tool_use stop_reason 不发 done，等工具执行完再说
+              } else if (d.type === 'message_stop') {
+                res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+              } else if (d.type === 'error') {
+                res.write('event: error\ndata: ' + JSON.stringify({message: d.error?.message || 'API error'}) + '\n\n');
+              }
+            } catch(e) {
+              // 忽略解析错误
+            }
+          }
+        }
+        res.flush?.();
+      }
+
+      // 保存助手消息到数据库
+      if (assistantText) {
+        db.prepare('INSERT INTO messages (conv_id, role, content, thinking) VALUES (?, ?, ?, ?)')
+          .run(convId, 'assistant', assistantText, thinkingText);
+        db.prepare("UPDATE sessions SET updated_at = strftime('%s','now') WHERE conv_id = ?").run(convId);
+      }
+      
+      // === 工具调用循环 ===
+      if (stopReason === 'tool_use' && toolCalls.length > 0) {
+        // 执行所有工具
+        const toolResults = [];
+        for (const tc of toolCalls) {
+          res.write('event: trace_summary\ndata: ' + JSON.stringify({text: '执行工具: ' + tc.name + '...'}) + '\n\n');
+          
+          const result = await executeTool(tc.name, tc.input);
+          toolResults.push({
+            type: 'tool_result',
+            tool_use_id: tc.id,
+            content: JSON.stringify(result)
+          });
+          
+          res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result}) + '\n\n');
+        }
+        
+        // 把工具结果加到消息历史，再发请求
+        const assistantMsg = { role: 'assistant', content: [
+          ...(thinkingText ? [{ type: 'thinking', thinking: thinkingText }] : []),
+          ...(assistantText ? [{ type: 'text', text: assistantText }] : []),
+          ...toolCalls.map(tc => ({ type: 'tool_use', id: tc.id, name: tc.name, input: tc.input })),
+        ]};
+        const toolResultMsg = { role: 'user', content: toolResults };
+        
+        const newHistory = [...history, assistantMsg, toolResultMsg];
+        
+        // 发起第二次请求
+        const secondBody = {
+          model: model || 'claude-sonnet-4-6',
+          max_tokens: 8096,
+          stream: true,
+          messages: newHistory,
+          system: systemPrompt,
+          tools: TOOLS,
+        };
+        if (thinkingConfig) secondBody.thinking = thinkingConfig;
+        
+        const secondRes = await fetch(baseUrl + '/v1/messages', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+          },
+          body: JSON.stringify(secondBody),
+        });
+        
+        if (!secondRes.ok) {
+          const err = await secondRes.json().catch(() => ({}));
+          res.write('event: error\ndata: ' + JSON.stringify({message: err.error?.message || '工具调用后续请求失败'}) + '\n\n');
+        } else {
+          // 流式读取第二次响应
+          const reader2 = secondRes.body.getReader();
+          const decoder2 = new TextDecoder();
+          let buffer2 = '';
+          let secondAssistantText = '';
+          let secondThinkingText = '';
+          
+          while (true) {
+            const { done: d2, value: v2 } = await reader2.read();
+            if (d2) break;
+            buffer2 += decoder2.decode(v2, { stream: true });
+            const lines2 = buffer2.split('\n');
+            buffer2 = lines2.pop() || '';
+            
+            for (const line2 of lines2) {
+              if (line2.startsWith('event:')) { currentEvent = line2.slice(6).trim(); }
+              else if (line2.startsWith('data:')) {
+                const raw2 = line2.slice(5).trim();
+                if (!raw2 || raw2 === '[DONE]') continue;
+                try {
+                  const dd = JSON.parse(raw2);
+                  if (dd.type === 'content_block_delta' && dd.delta?.type === 'thinking_delta') {
+                    secondThinkingText += dd.delta.thinking || '';
+                    res.write('event: thinking\ndata: ' + JSON.stringify({text: dd.delta.thinking || ''}) + '\n\n');
+                  } else if (dd.type === 'content_block_delta' && dd.delta?.type === 'text_delta') {
+                    secondAssistantText += dd.delta.text || '';
+                    res.write('event: delta\ndata: ' + JSON.stringify({text: dd.delta.text || ''}) + '\n\n');
+                  } else if (dd.type === 'message_delta' && (dd.delta?.stop_reason === 'end_turn' || dd.delta?.stop_reason === 'tool_use')) {
+                    res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+                  } else if (dd.type === 'error') {
+                    res.write('event: error\ndata: ' + JSON.stringify({message: dd.error?.message || 'Error'}) + '\n\n');
+                  }
+                } catch {}
+              }
+            }
+          }
+          
+          // 保存第二次的助手回复
+          if (secondAssistantText) {
+            db.prepare('INSERT INTO messages (conv_id, role, content, thinking) VALUES (?, ?, ?, ?)')
+              .run(convId, 'assistant', secondAssistantText, secondThinkingText);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('Stream error:', e);
+    }
+
+    res.end();
+  } catch (e) {
+    console.error('API proxy error:', e);
+    res.status(502).json({ detail: '中转站连接失败: ' + e.message });
+  }
+});
+
+// === Profile / 记忆库 ===
+app.get('/api/profile', auth, (req, res) => {
+  const profile = {
+    fullName: db.prepare("SELECT value FROM profile WHERE key = 'fullName'").get()?.value || '',
+    nickname: db.prepare("SELECT value FROM profile WHERE key = 'nickname'").get()?.value || '',
+    savedMemories: db.prepare('SELECT * FROM saved_memories ORDER BY created_at DESC').all(),
+    preferences: {
+      enabled: !!(db.prepare("SELECT value FROM profile WHERE key = 'prefs_enabled'").get()?.value !== '0'),
+      content: db.prepare("SELECT value FROM profile WHERE key = 'prefs_content'").get()?.value || '',
+    },
+    claudeExportImport: {},
+  };
+  res.json({ profile });
+});
+
+app.post('/api/profile', auth, (req, res) => {
+  const { fullName, nickname, savedMemories, preferences } = req.body;
+  const upsert = db.prepare('INSERT OR REPLACE INTO profile (key, value) VALUES (?, ?)');
+  if (fullName !== undefined) upsert.run('fullName', fullName);
+  if (nickname !== undefined) upsert.run('nickname', nickname);
+  if (preferences?.enabled !== undefined) upsert.run('prefs_enabled', preferences.enabled ? '1' : '0');
+  if (preferences?.content !== undefined) upsert.run('prefs_content', preferences.content);
+  
+  if (savedMemories) {
+    db.prepare('DELETE FROM saved_memories').run();
+    const insert = db.prepare('INSERT INTO saved_memories (id, content, enabled, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const m of savedMemories) {
+      insert.run(m.id || Date.now().toString(36) + Math.random().toString(36).slice(2),
+        m.content, m.enabled ? 1 : 0, m.source || 'manual',
+        Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000));
+    }
+  }
+  res.json({ ok: true });
+});
+
+app.put('/api/profile', auth, (req, res) => {
+  // PUT 和 POST 同样的逻辑
+  const { fullName, nickname, savedMemories, preferences } = req.body;
+  const upsert = db.prepare('INSERT OR REPLACE INTO profile (key, value) VALUES (?, ?)');
+  if (fullName !== undefined) upsert.run('fullName', fullName);
+  if (nickname !== undefined) upsert.run('nickname', nickname);
+  if (preferences?.enabled !== undefined) upsert.run('prefs_enabled', preferences.enabled ? '1' : '0');
+  if (preferences?.content !== undefined) upsert.run('prefs_content', preferences.content);
+  if (savedMemories) {
+    db.prepare('DELETE FROM saved_memories').run();
+    const insert = db.prepare('INSERT INTO saved_memories (id, content, enabled, source, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const m of savedMemories) {
+      insert.run(m.id || Date.now().toString(36) + Math.random().toString(36).slice(2),
+        m.content, m.enabled ? 1 : 0, m.source || 'manual',
+        Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000));
+    }
+  }
+  const profile = {
+    fullName: db.prepare("SELECT value FROM profile WHERE key = 'fullName'").get()?.value || '',
+    nickname: db.prepare("SELECT value FROM profile WHERE key = 'nickname'").get()?.value || '',
+    savedMemories: db.prepare('SELECT * FROM saved_memories ORDER BY created_at DESC').all(),
+    preferences: {
+      enabled: !!(db.prepare("SELECT value FROM profile WHERE key = 'prefs_enabled'").get()?.value !== '0'),
+      content: db.prepare("SELECT value FROM profile WHERE key = 'prefs_content'").get()?.value || '',
+    },
+  };
+  res.json({ ok: true, profile });
+});
+
+// === 日记 ===
+app.get('/api/diary', auth, (req, res) => {
+  const entries = db.prepare('SELECT * FROM diary ORDER BY date DESC').all();
+  res.json({ entries });
+});
+
+app.post('/api/diary', auth, (req, res) => {
+  const { date, content } = req.body;
+  db.prepare('INSERT OR REPLACE INTO diary (date, content, created_at) VALUES (?, ?, strftime("%s","now"))')
+    .run(date, content);
+  res.json({ ok: true });
+});
+
+
+
+// === 工具标题 (前端 tool caption 请求) ===
+app.post('/api/tool-caption', auth, (req, res) => {
+  const { tool_use_id, name } = req.body;
+  const titles = {
+    get_weather: '🌤 查询天气',
+    get_time: '🕐 获取时间',
+    search_memory: '🧠 搜索记忆',
+    save_note: '📝 保存笔记'
+  };
+  res.json({ caption: titles[name] || ('🔧 ' + (name || 'Tool')) });
+});
+
+// === Projects ===
+app.get('/api/projects', auth, (req, res) => {
+  const projects = db.prepare('SELECT * FROM projects ORDER BY updated_at DESC').all();
+  // 附加文件数
+  projects.forEach(p => {
+    p.file_count = db.prepare('SELECT COUNT(*) as c FROM project_files WHERE project_id = ?').get(p.id).c;
+  });
+  res.json({ projects });
+});
+
+app.post('/api/projects', auth, (req, res) => {
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const { name, description } = req.body;
+  if (!name) return res.status(400).json({ detail: '项目名不能为空' });
+  db.prepare('INSERT INTO projects (id, name, description) VALUES (?, ?, ?)').run(id, name, description || '');
+  // 创建项目目录
+  const pDir = path.join(projectDir, id);
+  if (!fs.existsSync(pDir)) fs.mkdirSync(pDir, { recursive: true });
+  res.json({ id, name, description });
+});
+
+app.delete('/api/projects/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM project_files WHERE project_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
+  // 删除项目目录
+  const pDir = path.join(projectDir, req.params.id);
+  if (fs.existsSync(pDir)) fs.rmSync(pDir, { recursive: true });
+  res.json({ ok: true });
+});
+
+app.put('/api/projects/:id', auth, (req, res) => {
+  const { name, description } = req.body;
+  if (!name) return res.status(400).json({ detail: 'Project name required' });
+  db.prepare('UPDATE projects SET name = ?, description = ?, updated_at = strftime("%s","now") WHERE id = ?')
+    .run(name, description || '', req.params.id);
+  res.json({ ok: true });
+});
+
+// 项目文件列表
+app.get('/api/projects/:id/files', auth, (req, res) => {
+  const files = db.prepare('SELECT id, filename, size, created_at, updated_at FROM project_files WHERE project_id = ? ORDER BY filename').all(req.params.id);
+  res.json({ files });
+});
+
+// 读取文件内容
+app.get('/api/projects/:pid/files/:fid', auth, (req, res) => {
+  const file = db.prepare('SELECT * FROM project_files WHERE id = ? AND project_id = ?').get(req.params.fid, req.params.pid);
+  if (!file) return res.status(404).json({ detail: '文件不存在' });
+  res.json(file);
+});
+
+// 上传/写入文件到项目
+app.post('/api/projects/:id/files', auth, (req, res) => {
+  const { filename, content } = req.body;
+  if (!filename) return res.status(400).json({ detail: '文件名不能为空' });
+  const projectId = req.params.id;
+  
+  // 检查项目是否存在
+  const project = db.prepare('SELECT id FROM projects WHERE id = ?').get(projectId);
+  if (!project) return res.status(404).json({ detail: '项目不存在' });
+  
+  const fileContent = content || '';
+  const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  
+  // 同时写到磁盘和数据库
+  const filePath = path.join(projectDir, projectId, filename);
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(filePath, fileContent, 'utf8');
+  
+  db.prepare('INSERT INTO project_files (id, project_id, filename, content, size, updated_at) VALUES (?, ?, ?, ?, ?, strftime("%s","now"))')
+    .run(id, projectId, filename, fileContent, Buffer.byteLength(fileContent));
+  
+  db.prepare("UPDATE projects SET updated_at = strftime('%s','now') WHERE id = ?").run(projectId);
+  res.json({ id, filename, size: Buffer.byteLength(fileContent) });
+});
+
+// 更新文件
+app.put('/api/projects/:pid/files/:fid', auth, (req, res) => {
+  const { content } = req.body;
+  const file = db.prepare('SELECT * FROM project_files WHERE id = ? AND project_id = ?').get(req.params.fid, req.params.pid);
+  if (!file) return res.status(404).json({ detail: '文件不存在' });
+  
+  const newContent = content !== undefined ? content : file.content;
+  db.prepare('UPDATE project_files SET content = ?, size = ?, updated_at = strftime("%s","now") WHERE id = ?')
+    .run(newContent, Buffer.byteLength(newContent), req.params.fid);
+  
+  // 同步磁盘
+  const filePath = path.join(projectDir, req.params.pid, file.filename);
+  fs.writeFileSync(filePath, newContent, 'utf8');
+  
+  db.prepare("UPDATE projects SET updated_at = strftime('%s','now') WHERE id = ?").run(req.params.pid);
+  res.json({ ok: true });
+});
+
+// 删除文件
+app.delete('/api/projects/:pid/files/:fid', auth, (req, res) => {
+  const file = db.prepare('SELECT * FROM project_files WHERE id = ? AND project_id = ?').get(req.params.fid, req.params.pid);
+  if (!file) return res.status(404).json({ detail: '文件不存在' });
+  db.prepare('DELETE FROM project_files WHERE id = ?').run(req.params.fid);
+  const filePath = path.join(projectDir, req.params.pid, file.filename);
+  if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+  res.json({ ok: true });
+});
+
+// === 文件上传 ===
+app.post('/api/upload', auth, upload.array('files', 10), (req, res) => {
+  if (!req.files?.length) return res.status(400).json({ detail: '没有文件' });
+  const attachments = req.files.map(f => {
+    const id = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const ext = path.extname(f.originalname) || '';
+    const finalPath = path.join(uploadDir, id + ext);
+    fs.renameSync(f.path, finalPath);
+    db.prepare('INSERT INTO uploads (id, filename, path, size) VALUES (?, ?, ?, ?)')
+      .run(id, f.originalname, finalPath, f.size);
+    return { path: id, filename: f.originalname, size: f.size };
+  });
+  const convId = req.body.conversation_id || null;
+  res.json({ attachments, conversation_id: convId });
+});
+
+// === 模型列表 ===
+app.get('/api/models', (req, res) => {
+  res.json({
+    models: [
+      { id: 'claude-fable-5', label: 'Fable 5', desc: 'Creative & nuanced', thinking: 'none', primary: false },
+      { id: 'claude-opus-4-8', label: 'Opus 4.8', desc: 'Powerful reasoning', thinking: 'extended', primary: false },
+      { id: 'claude-sonnet-4-6', label: 'Sonnet 4.6', desc: 'Everyday tasks', thinking: 'adaptive', primary: true },
+      { id: 'claude-haiku-4-5', label: 'Haiku 4.5', desc: 'Fast & efficient', thinking: 'none', primary: false },
+    ]
+  });
+});
+
+// === 问候语 ===
+app.get('/api/splash', (req, res) => {
+  const hour = new Date().getHours();
+  let period = 'night', line = "What's on your mind?";
+  if (hour >= 5 && hour < 12) { period = 'morning'; line = 'Good morning! How can I help?'; }
+  else if (hour >= 12 && hour < 18) { period = 'afternoon'; line = 'Good afternoon! What can I do for you?'; }
+  else if (hour >= 18 && hour < 22) { period = 'evening'; line = 'Good evening! How can I assist you?'; }
+  res.json({ period, line });
+});
+
+// === 启动 ===
+app.listen(PORT, () => {
+  console.log('');
+  console.log('  🚀 Claude Chat Server');
+  console.log(`  Frontend:  http://localhost:${PORT}`);
+  console.log(`  Backend:   http://localhost:${PORT}/api`);
+  console.log('');
+});
