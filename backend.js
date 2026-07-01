@@ -127,7 +127,7 @@ const AUTH_TOKEN = process.env.AUTH_TOKEN || 'claude-chat-' + Date.now().toStrin
 
 // 登录（设置中转站配置）
 app.post('/api/auth', (req, res) => {
-  const { base_url, api_key } = req.body;
+  const { base_url, api_key, api_format, model } = req.body;
   if (!base_url || !api_key) {
     return res.status(400).json({ detail: '需要 Base URL 和 API Key' });
   }
@@ -135,6 +135,8 @@ app.post('/api/auth', (req, res) => {
   const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
   upsert.run('base_url', base_url);
   upsert.run('api_key', api_key);
+  upsert.run('api_format', api_format || 'anthropic');
+  if (model) upsert.run('model', model);
   res.json({ token: AUTH_TOKEN });
 });
 
@@ -605,6 +607,8 @@ app.post('/api/chat', auth, async (req, res) => {
   // 获取中转站配置
   const baseUrl = db.prepare("SELECT value FROM settings WHERE key = 'base_url'").get()?.value;
   const apiKey = db.prepare("SELECT value FROM settings WHERE key = 'api_key'").get()?.value;
+  const apiFormat = db.prepare("SELECT value FROM settings WHERE key = 'api_format'").get()?.value || 'anthropic';
+  const defaultModel = db.prepare("SELECT value FROM settings WHERE key = 'model'").get()?.value || '';
 
   if (!baseUrl || !apiKey) {
     return res.status(400).json({ detail: '未配置中转站 API' });
@@ -675,10 +679,30 @@ app.post('/api/chat', auth, async (req, res) => {
     } catch(e) { /* ignore */ }
   }
 
+  const useModel = model || defaultModel || 'claude-sonnet-4-6';
   const systemPrompt = "You are a helpful assistant named Claude. Reply in the user's language by default. Be warm, concise, and accurate. You have access to tools - use them when appropriate (e.g., check weather, save notes, search memory, get time, store/recall Ombre Brain memories). Always use tools proactively when the user's request matches a tool's capability." + (breathMemory ? "\n\n---\n[Ombre Brain - 当前浮现的记忆]\n" + breathMemory : "") + (projectInstructions ? "\n\n---\n[Project Instructions]\n" + projectInstructions : "");
 
+  // ★ 根据格式分流
+  if (apiFormat === 'anthropic') {
+    return handleAnthropicChat(req, res, { baseUrl, apiKey, model: useModel, history, systemPrompt, thinkingConfig, convId });
+  } else {
+    return handleOpenAIChat(req, res, { baseUrl, apiKey, model: useModel, history, systemPrompt, convId });
+  }
+});
+
+// === Anthropic 原生格式处理 ===
+async function handleAnthropicChat(req, res, ctx) {
+  const { baseUrl, apiKey, model, history, systemPrompt, thinkingConfig, convId } = ctx;
+
+  // 智能拼接 endpoint：避免 base_url 已含路径时重复
+  let endpoint = baseUrl.replace(/\/+$/, '');
+  if (endpoint.endsWith('/v1/messages')) { /* 已完整，直接用 */ }
+  else if (endpoint.endsWith('/v1')) { endpoint += '/messages'; }
+  else if (endpoint.includes('/v1/')) { /* base_url 含 /v1/ 但不是 /v1/messages，如 /v1/chat → 不改 */ endpoint += '/messages'; }
+  else { endpoint += '/v1/messages'; }
+
   const requestBody = {
-    model: model || 'claude-sonnet-4-6',
+    model,
     max_tokens: 8096,
     stream: true,
     messages: history,
@@ -687,9 +711,8 @@ app.post('/api/chat', auth, async (req, res) => {
   };
   if (thinkingConfig) requestBody.thinking = thinkingConfig;
 
-  // 代理请求到中转站
   try {
-    const apiRes = await fetch(baseUrl + '/v1/messages', {
+    const apiRes = await fetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -697,6 +720,7 @@ app.post('/api/chat', auth, async (req, res) => {
         'anthropic-version': '2023-06-01',
       },
       body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(120000),
     });
 
     if (!apiRes.ok) {
@@ -712,6 +736,12 @@ app.post('/api/chat', auth, async (req, res) => {
 
     let assistantText = '';
     let thinkingText = '';
+    let currentContentBlockType = '';
+    let currentToolId = '';
+    let currentToolName = '';
+    let currentToolInput = '';
+    let toolCalls = [];
+    let stopReason = '';
     const reader = apiRes.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -832,7 +862,7 @@ app.post('/api/chat', auth, async (req, res) => {
         
         // 发起第二次请求
         const secondBody = {
-          model: model || 'claude-sonnet-4-6',
+          model,
           max_tokens: 8096,
           stream: true,
           messages: newHistory,
@@ -841,7 +871,7 @@ app.post('/api/chat', auth, async (req, res) => {
         };
         if (thinkingConfig) secondBody.thinking = thinkingConfig;
         
-        const secondRes = await fetch(baseUrl + '/v1/messages', {
+        const secondRes = await fetch(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -849,6 +879,7 @@ app.post('/api/chat', auth, async (req, res) => {
             'anthropic-version': '2023-06-01',
           },
           body: JSON.stringify(secondBody),
+          signal: AbortSignal.timeout(120000),
         });
         
         if (!secondRes.ok) {
@@ -905,10 +936,263 @@ app.post('/api/chat', auth, async (req, res) => {
 
     res.end();
   } catch (e) {
-    console.error('API proxy error:', e);
-    res.status(502).json({ detail: '中转站连接失败: ' + e.message });
+    console.error('API proxy error (Anthropic):', e);
+    if (!res.headersSent) res.status(502).json({ detail: '中转站连接失败: ' + e.message });
   }
-});
+}
+
+// === OpenAI 兼容格式处理 ===
+async function handleOpenAIChat(req, res, ctx) {
+  const { baseUrl, apiKey, model, history, systemPrompt, convId } = ctx;
+
+  // 智能拼接 endpoint
+  let endpoint = baseUrl.replace(/\/+$/, '');
+  if (!endpoint.includes('/v1/')) endpoint += '/v1/chat/completions';
+  else if (!endpoint.includes('/chat/completions')) endpoint += '/chat/completions';
+
+  // 转换 history 为 OpenAI messages 格式
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.map(m => {
+      if (Array.isArray(m.content)) {
+        const textParts = m.content.filter(c => c.type === 'text').map(c => c.text);
+        const imageParts = m.content.filter(c => c.type === 'image');
+        if (imageParts.length > 0) {
+          const parts = [];
+          if (textParts.length) parts.push({ type: 'text', text: textParts.join('\n') });
+          imageParts.forEach(img => {
+            if (img.source?.data) {
+              parts.push({ type: 'image_url', image_url: { url: `data:${img.source.media_type};base64,${img.source.data}` } });
+            }
+          });
+          return { role: m.role, content: parts };
+        }
+        return { role: m.role, content: textParts.join('\n') || '' };
+      }
+      return { role: m.role, content: m.content || '' };
+    })
+  ];
+
+  // 转换 Tools 格式：Anthropic input_schema → OpenAI function.parameters
+  const openaiTools = TOOLS.map(t => ({
+    type: 'function',
+    function: { name: t.name, description: t.description, parameters: t.input_schema }
+  }));
+
+  const requestBody = { model, stream: true, messages, tools: openaiTools };
+
+  try {
+    const apiRes = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(requestBody),
+      signal: AbortSignal.timeout(120000),
+    });
+
+    if (!apiRes.ok) {
+      const err = await apiRes.json().catch(() => ({}));
+      return res.status(apiRes.status).json({ detail: err.error?.message || `API 返回 ${apiRes.status}` });
+    }
+
+    // 流式代理 SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    let assistantText = '';
+    let thinkingText = '';
+    let toolCalls = [];
+    let currentToolId = '';
+    let currentToolName = '';
+    let currentToolArgs = '';
+    let finishReason = '';
+    const reader = apiRes.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith(':')) continue; // 心跳
+          if (!line.startsWith('data:')) continue;
+          const rawData = line.slice(5).trim();
+          if (!rawData || rawData === '[DONE]') {
+            if (finishReason !== 'tool_calls') {
+              res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+            }
+            continue;
+          }
+          try {
+            const d = JSON.parse(rawData);
+            const choice = d.choices?.[0];
+            if (!choice) continue;
+
+            const delta = choice.delta;
+
+            // 文本
+            if (delta?.content) {
+              assistantText += delta.content;
+              res.write('event: delta\ndata: ' + JSON.stringify({text: delta.content}) + '\n\n');
+            }
+
+            // 思考（部分 OpenAI 中转站支持 reasoning_content）
+            const reasoning = delta?.reasoning_content || delta?.reasoning;
+            if (reasoning) {
+              thinkingText += reasoning;
+              res.write('event: thinking\ndata: ' + JSON.stringify({text: reasoning}) + '\n\n');
+            }
+
+            // Tool calls（OpenAI 增量式）
+            if (delta?.tool_calls) {
+              for (const tc of delta.tool_calls) {
+                if (tc.id) {
+                  currentToolId = tc.id;
+                  currentToolName = tc.function?.name || '';
+                  currentToolArgs = '';
+                  toolCalls.push({ id: tc.id, name: currentToolName, arguments: '' });
+                  res.write('event: tool_use\ndata: ' + JSON.stringify({id: tc.id, name: currentToolName, input: {}}) + '\n\n');
+                }
+                if (tc.function?.arguments) {
+                  currentToolArgs += tc.function.arguments;
+                  const existing = toolCalls.find(x => x.id === currentToolId);
+                  if (existing) existing.arguments = currentToolArgs;
+                }
+              }
+            }
+
+            if (choice.finish_reason) finishReason = choice.finish_reason;
+          } catch(e) { /* 忽略解析错误 */ }
+        }
+        res.flush?.();
+      }
+
+      // 保存助手消息
+      if (assistantText) {
+        db.prepare('INSERT INTO messages (conv_id, role, content, thinking) VALUES (?, ?, ?, ?)')
+          .run(convId, 'assistant', assistantText, thinkingText);
+        db.prepare("UPDATE sessions SET updated_at = strftime('%s','now') WHERE conv_id = ?").run(convId);
+      }
+
+      // === 工具调用循环（OpenAI 格式）===
+      if (finishReason === 'tool_calls' && toolCalls.length > 0) {
+        // 解析参数并执行
+        const parsedToolCalls = toolCalls.map(tc => {
+          let parsedInput = {};
+          try { parsedInput = JSON.parse(tc.arguments); } catch(e) { parsedInput = { raw: tc.arguments }; }
+          return { id: tc.id, name: tc.name, input: parsedInput };
+        });
+
+        const toolResults = [];
+        for (const tc of parsedToolCalls) {
+          res.write('event: trace_summary\ndata: ' + JSON.stringify({text: '执行工具: ' + tc.name + '...'}) + '\n\n');
+          const result = await executeTool(tc.name, tc.input);
+          toolResults.push({ id: tc.id, result });
+          res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result}) + '\n\n');
+        }
+
+        // 构建 OpenAI 格式后续消息
+        const assistantToolMsg = {
+          role: 'assistant',
+          content: assistantText || null,
+          tool_calls: toolCalls.map(tc => ({
+            id: tc.id, type: 'function', function: { name: tc.name, arguments: tc.arguments }
+          }))
+        };
+
+        const toolResultMessages = parsedToolCalls.map((tc, i) => ({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: JSON.stringify(toolResults[i].result)
+        }));
+
+        const newMessages = [...messages, assistantToolMsg, ...toolResultMessages];
+
+        // 第二次请求
+        const secondBody = { model, stream: true, messages: newMessages, tools: openaiTools };
+        const secondRes = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(secondBody),
+          signal: AbortSignal.timeout(120000),
+        });
+
+        if (!secondRes.ok) {
+          const err = await secondRes.json().catch(() => ({}));
+          res.write('event: error\ndata: ' + JSON.stringify({message: err.error?.message || '工具调用后续请求失败'}) + '\n\n');
+        } else {
+          const reader2 = secondRes.body.getReader();
+          const decoder2 = new TextDecoder();
+          let buffer2 = '';
+          let secondAssistantText = '';
+          let secondThinkingText = '';
+
+          while (true) {
+            const { done: d2, value: v2 } = await reader2.read();
+            if (d2) break;
+            buffer2 += decoder2.decode(v2, { stream: true });
+            const lines2 = buffer2.split('\n');
+            buffer2 = lines2.pop() || '';
+
+            for (const line2 of lines2) {
+              if (line2.startsWith(':')) continue;
+              if (!line2.startsWith('data:')) continue;
+              const raw2 = line2.slice(5).trim();
+              if (!raw2 || raw2 === '[DONE]') {
+                res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+                continue;
+              }
+              try {
+                const dd = JSON.parse(raw2);
+                const ch = dd.choices?.[0];
+                if (!ch) continue;
+                const c2 = ch.delta?.content;
+                if (c2) {
+                  secondAssistantText += c2;
+                  res.write('event: delta\ndata: ' + JSON.stringify({text: c2}) + '\n\n');
+                }
+                const r2 = ch.delta?.reasoning_content || ch.delta?.reasoning;
+                if (r2) {
+                  secondThinkingText += r2;
+                  res.write('event: thinking\ndata: ' + JSON.stringify({text: r2}) + '\n\n');
+                }
+                if (ch.finish_reason === 'stop') {
+                  res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+                }
+              } catch {}
+            }
+          }
+
+          if (secondAssistantText) {
+            db.prepare('INSERT INTO messages (conv_id, role, content, thinking) VALUES (?, ?, ?, ?)')
+              .run(convId, 'assistant', secondAssistantText, secondThinkingText);
+          }
+        }
+      } else if (finishReason === 'stop' && !assistantText) {
+        res.write('event: done\ndata: ' + JSON.stringify({conversation_id: convId}) + '\n\n');
+      }
+    } catch (e) {
+      console.error('Stream error (OpenAI):', e);
+    }
+    res.end();
+  } catch (e) {
+    console.error('API proxy error (OpenAI):', e);
+    if (!res.headersSent) res.status(502).json({ detail: '中转站连接失败: ' + e.message });
+  }
+}
 
 // === Profile / 记忆库 ===
 app.get('/api/profile', auth, (req, res) => {
