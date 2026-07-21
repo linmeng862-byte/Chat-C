@@ -126,8 +126,6 @@ if (!fs.existsSync(projectDir)) fs.mkdirSync(projectDir, { recursive: true });
 const multer = require('multer');
 const upload = multer({ dest: path.join(__dirname, 'data', 'uploads', 'tmp'), limits: { fileSize: 20 * 1024 * 1024 } });
 const readingUpload = multer({ dest: path.join(__dirname, 'data', 'uploads', 'tmp'), limits: { fileSize: 50 * 1024 * 1024 } });
-
-const readingUpload = multer({ dest: path.join(__dirname, "data", "uploads", "tmp"), limits: { fileSize: 50 * 1024 * 1024 } });
 // === 中间件 ===
 app.use(express.json({ limit: '50mb' }));
 // ── 阅读器 API ──────────────────────────────────────────
