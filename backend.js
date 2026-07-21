@@ -451,14 +451,18 @@ const CONTINUITY_URL = 'https://zzloveclaude.zeabur.app';
 // Continuity MCP 调用辅助 —— JSON-RPC POST → /mcp
 async function callContinuity(toolName, args = {}) {
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
     const r = await fetch(CONTINUITY_URL + '/mcp', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'tools/call',
         params: { name: toolName, arguments: args }
-      })
+      }),
+      signal: controller.signal
     });
+    clearTimeout(timeout);
     if (!r.ok) return { error: 'Continuity 返回 ' + r.status };
     const data = await r.json();
     // 提取 text content
@@ -1402,19 +1406,27 @@ async function handleAnthropicChat(req, res, ctx) {
       
       // === 工具调用循环 ===
       if (stopReason === 'tool_use' && toolCalls.length > 0) {
-        // 执行所有工具
+        // 执行所有工具（带超时保护）
         const toolResults = [];
         for (const tc of toolCalls) {
           res.write('event: trace_summary\ndata: ' + JSON.stringify({text: '执行工具: ' + tc.name + '...'}) + '\n\n');
-          
-          const result = await executeTool(tc.name, tc.input);
+
+          let result;
+          try {
+            result = await Promise.race([
+              executeTool(tc.name, tc.input),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('工具执行超时(15s)')), 15000))
+            ]);
+          } catch (e) {
+            result = { error: '工具执行失败: ' + e.message, is_error: true };
+          }
           toolResults.push({
             type: 'tool_result',
             tool_use_id: tc.id,
             content: JSON.stringify(result)
           });
-          
-          res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result}) + '\n\n');
+
+          res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result, is_error: result.is_error || false}) + '\n\n');
         }
         
         // 把工具结果加到消息历史，再发请求
@@ -1661,9 +1673,17 @@ async function handleOpenAIChat(req, res, ctx) {
         const toolResults = [];
         for (const tc of parsedToolCalls) {
           res.write('event: trace_summary\ndata: ' + JSON.stringify({text: '执行工具: ' + tc.name + '...'}) + '\n\n');
-          const result = await executeTool(tc.name, tc.input);
+          let result;
+          try {
+            result = await Promise.race([
+              executeTool(tc.name, tc.input),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('工具执行超时(15s)')), 15000))
+            ]);
+          } catch(e) {
+            result = { error: '工具执行失败: ' + e.message, is_error: true };
+          }
           toolResults.push({ id: tc.id, result });
-          res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result}) + '\n\n');
+          res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result, is_error: result.is_error || false}) + '\n\n');
         }
 
         // 构建 OpenAI 格式后续消息
