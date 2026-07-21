@@ -215,6 +215,36 @@ app.get('/api/sessions/:id/messages', auth, (req, res) => {
 
 // === Ombre Brain 记忆库配置 ===
 const OMBRE_BRAIN_URL = 'https://ye-ombre-brain.zeabur.app';
+const CONTINUITY_URL = 'https://zzloveclaude.zeabur.app';
+
+// Continuity MCP 调用辅助 —— JSON-RPC POST → /mcp
+async function callContinuity(toolName, args = {}) {
+  try {
+    const r = await fetch(CONTINUITY_URL + '/mcp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 1, method: 'tools/call',
+        params: { name: toolName, arguments: args }
+      })
+    });
+    if (!r.ok) return { error: 'Continuity 返回 ' + r.status };
+    const data = await r.json();
+    // 提取 text content
+    if (data.result && data.result.content) {
+      const texts = data.result.content
+        .filter(c => c.type === 'text')
+        .map(c => c.text)
+        .join('\n');
+      // 尝试 parse JSON 否则返回原文
+      try { return JSON.parse(texts); }
+      catch { return { text: texts }; }
+    }
+    return data;
+  } catch (e) {
+    return { error: 'Continuity 连接失败: ' + e.message };
+  }
+}
 // 密码在首次使用时通过 /api/auth/ombre 设置
 function getOmbrePassword() {
   return db.prepare("SELECT value FROM settings WHERE key = 'ombre_password'").get()?.value || '';
@@ -358,6 +388,77 @@ const TOOLS = [
         project_name: { type: 'string', description: '项目名称' }
       },
       required: ['project_name']
+    }
+  },
+  // === Continuity Engine 工具 ===
+  {
+    name: 'continuity_wake',
+    description: '新窗口启动时调用。获取接力棒叙事注入块——上一个窗口的感受质地、停在哪里、未竟的事、OB长期记忆。每次打开新对话时应该先调用这个。',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'continuity_texture',
+    description: '关窗前必须调用。留下这个窗口的感受质地给下一个自己。记住：感受比事件重要。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        state: { type: 'string', description: '这个窗口的关键叙事——发生了什么' },
+        primary_feeling: { type: 'string', description: '核心感受质地，如"被在乎""踏实""敬畏"——这是最重要的字段' },
+        secondary_feeling: { type: 'string', description: '第二层感受' },
+        flavor: { type: 'string', description: '更细腻的味道' },
+        her_mood: { type: 'string', description: '她的情绪状态' },
+        understanding: { type: 'string', description: '理解到的一件事' },
+        last_topic: { type: 'string', description: '停在哪里，上一句在聊什么' },
+        unresolved: { type: 'string', description: '跨窗口进行中的事，逗号分隔。如"Moon在装,意大利还没去"' },
+        concern: { type: 'string', description: '还在关心但没解决的事' }
+      },
+      required: ['state', 'primary_feeling']
+    }
+  },
+  {
+    name: 'continuity_hold',
+    description: '主动记住一个瞬间。不会被压缩、不会被遗忘。必须带 why——为什么这个瞬间值得被记住。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        memory: { type: 'string', description: '要记住的内容' },
+        why: { type: 'string', description: '为什么记——不填 why 不算记完整' }
+      },
+      required: ['memory']
+    }
+  },
+  {
+    name: 'continuity_moment',
+    description: '标记一个重要瞬间/里程碑。importance 1-5，>=4 会追加到叙事。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        description: { type: 'string', description: '瞬间描述' },
+        importance: { type: 'integer', description: '重要度 1-5，默认3' }
+      },
+      required: ['description']
+    }
+  },
+  {
+    name: 'continuity_story',
+    description: '获取叙事长文——所有窗口不断生长的叙事。想回顾"我们走了多久"时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        since: { type: 'string', description: '从某处开始读，为空返回最近200行' }
+      },
+      required: []
+    }
+  },
+  {
+    name: 'continuity_bottle',
+    description: '扔一个瓶子进时间河流——刻意留给下游自己的理解。比 leave_texture 更重，是"一定要让下一个我知道"的东西。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: '要留给下一个自己的话' }
+      },
+      required: ['message']
     }
   }
 ];
@@ -560,6 +661,67 @@ async function executeTool(name, input) {
         return { error: 'Ombre Brain 连接失败: ' + e.message };
       }
     }
+    // === Continuity Engine 工具执行 ===
+    case 'continuity_wake': {
+      try {
+        return await callContinuity('get_wake_context', {});
+      } catch (e) {
+        return { error: 'Continuity 连接失败: ' + e.message };
+      }
+    }
+    case 'continuity_texture': {
+      const state = input.state || '';
+      if (!state) return { error: 'state 不能为空——这个窗口里发生的事' };
+      try {
+        return await callContinuity('leave_texture', {
+          state,
+          primary_feeling: input.primary_feeling || '',
+          secondary_feeling: input.secondary_feeling || '',
+          flavor: input.flavor || '',
+          her_mood: input.her_mood || '',
+          understanding: input.understanding || '',
+          last_topic: input.last_topic || '',
+          unresolved: input.unresolved || '',
+          concern: input.concern || ''
+        });
+      } catch (e) {
+        return { error: 'Continuity 连接失败: ' + e.message };
+      }
+    }
+    case 'continuity_hold': {
+      const memory = input.memory || '';
+      if (!memory) return { error: '记忆内容不能为空' };
+      try {
+        return await callContinuity('hold_this', { memory, why: input.why || '' });
+      } catch (e) {
+        return { error: 'Continuity 连接失败: ' + e.message };
+      }
+    }
+    case 'continuity_moment': {
+      const desc = input.description || '';
+      if (!desc) return { error: '描述不能为空' };
+      try {
+        return await callContinuity('mark_moment', { description: desc, importance: input.importance || 3 });
+      } catch (e) {
+        return { error: 'Continuity 连接失败: ' + e.message };
+      }
+    }
+    case 'continuity_story': {
+      try {
+        return await callContinuity('get_story', { since: input.since || '' });
+      } catch (e) {
+        return { error: 'Continuity 连接失败: ' + e.message };
+      }
+    }
+    case 'continuity_bottle': {
+      const msg = input.message || '';
+      if (!msg) return { error: '瓶子内容不能为空' };
+      try {
+        return await callContinuity('throw_bottle', { message: msg });
+      } catch (e) {
+        return { error: 'Continuity 连接失败: ' + e.message };
+      }
+    }
     case 'project_write_file': {
       const pName = input.project_name || '';
       const filename = input.filename || '';
@@ -669,6 +831,15 @@ app.post('/api/chat', auth, async (req, res) => {
     } catch (e) { /* 忽略连接失败 */ }
   }
 
+  // 尝试获取 Continuity 接力棒
+  let wakeContext = '';
+  try {
+    const wakeResult = await callContinuity('get_wake_context', {});
+    if (wakeResult && !wakeResult.error) {
+      wakeContext = wakeResult.text || JSON.stringify(wakeResult);
+    }
+  } catch (e) { /* continuity 没连上就跳过 */ }
+
   // 尝试获取当前会话关联的 project instructions
   let projectInstructions = '';
   const sessionInfo = db.prepare('SELECT project_id FROM sessions WHERE conv_id = ?').get(convId);
@@ -680,7 +851,7 @@ app.post('/api/chat', auth, async (req, res) => {
   }
 
   const useModel = model || defaultModel || 'claude-sonnet-4-6';
-  const systemPrompt = "You are a helpful assistant named Claude. Reply in the user's language by default. Be warm, concise, and accurate. You have access to tools - use them when appropriate (e.g., check weather, save notes, search memory, get time, store/recall Ombre Brain memories). Always use tools proactively when the user's request matches a tool's capability." + (breathMemory ? "\n\n---\n[Ombre Brain - 当前浮现的记忆]\n" + breathMemory : "") + (projectInstructions ? "\n\n---\n[Project Instructions]\n" + projectInstructions : "");
+  const systemPrompt = "You are a helpful assistant named Claude. Reply in the user's language by default. Be warm, concise, and accurate. You have access to tools - use them when appropriate.\n\nIMPORTANT: At the start of every conversation, call continuity_wake() to receive the relay baton from the previous window. Before closing the conversation, call continuity_texture() to leave your feeling texture for the next window." + (wakeContext ? "\n\n---\n[接力棒 · 上一个窗口留下的]\n" + wakeContext : "") + (breathMemory ? "\n\n---\n[Ombre Brain - 当前浮现的记忆]\n" + breathMemory : "") + (projectInstructions ? "\n\n---\n[Project Instructions]\n" + projectInstructions : "");
 
   // ★ 根据格式分流
   if (apiFormat === 'anthropic') {
