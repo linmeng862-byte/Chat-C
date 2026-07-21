@@ -2227,6 +2227,60 @@ function escHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
+// === Sticker Panel ===
+$('stickerButton').onclick = function() {
+  $('stickerPanel').style.display = 'block';
+  loadStickers('happy');
+  renderStickerCats();
+};
+$('closeSticker').onclick = function() { $('stickerPanel').style.display = 'none'; };
+
+function renderStickerCats() {
+  var cats = ['happy','cry','love','angry','surprise','shy'];
+  var h = '';
+  cats.forEach(function(c) {
+    h += '<button style="padding:4px 10px;border:1px solid var(--border);border-radius:12px;font:11px var(--font-sans);background:transparent;color:var(--text-secondary);cursor:pointer;margin-right:4px" onclick="loadStickers(\''+c+'\')">'+c+'</button>';
+  });
+  $('stickerCats').innerHTML = h;
+}
+
+async function loadStickers(cat) {
+  var r = await fetch('/api/stickers?category=' + encodeURIComponent(cat || 'happy'));
+  var stickers = await r.json();
+  var grid = $('stickerGrid');
+  if (!stickers.length) {
+    grid.innerHTML = '<p style="color:var(--text-secondary);grid-column:1/-1;text-align:center;padding:16px">还没有表情包，上传图吧！</p>';
+    return;
+  }
+  grid.innerHTML = stickers.map(function(s) {
+    return '<img src="/stickers/'+s.filename+'" style="width:100%;aspect-ratio:1;object-fit:contain;border-radius:8px;cursor:pointer;background:var(--bg-sunken)" onclick="sendSticker(\''+s.filename+'\')" />';
+  }).join('');
+}
+
+function sendSticker(fname) {
+  var msg = document.createElement('div'); msg.className = 'msg msg-user';
+  var b = document.createElement('div'); b.className = 'msg-bubble bubble-user';
+  var img = document.createElement('img'); img.src = '/stickers/'+fname;
+  img.style.cssText = 'max-width:200px;max-height:200px;border-radius:12px;display:block';
+  b.append(img); msg.append(b);
+  $('stream').append(msg); msg.scrollIntoView({behavior:'smooth'});
+  $('stickerPanel').style.display = 'none';
+}
+
+$('stickerFileInput').onchange = async function() {
+  var f = this.files[0]; if (!f) return;
+  var cat = document.getElementById('stickerCategory').value || 'happy';
+  var fd = new FormData(); fd.append('file', f); fd.append('category', cat);
+  try {
+    var r = await fetch('/api/stickers/upload', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + state.token }, body: fd
+    });
+    if (r.ok) { toast('Sticker uploaded!'); loadStickers(cat); }
+    else { var e = await r.json().catch(function(){return{}}); toast('Upload failed: '+(e.error||r.status)); }
+  } catch(ex) { toast('Upload failed: '+ex.message); }
+  this.value = '';
+};
+
 </script>
 </body>
 </html>
