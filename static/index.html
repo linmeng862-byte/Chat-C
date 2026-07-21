@@ -516,7 +516,7 @@ html[data-theme="dark"] .delete-confirm-popover,.rename-dialog{background:var(--
   <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
     <span style="font:600 14px var(--font-sans)">Stickers</span>
     <div style="display:flex;gap:8px" id="stickerCats"></div>
-    <button id="closeSticker" style="border:none;background:none;font-size:18px;cursor:pointer;color:var(--text-secondary)">&times;</button>
+    <button id="closeSticker" style="border:none;background:var(--bg-sunken);width:32px;height:32px;border-radius:50%;font-size:20px;cursor:pointer;color:var(--text-secondary);display:flex;align-items:center;justify-content:center">&times;</button>
   </div>
   <div id="stickerGrid" style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px"></div>
   <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
@@ -2230,10 +2230,20 @@ function escHtml(s) {
 // === Sticker Panel ===
 $('stickerButton').onclick = function() {
   $('stickerPanel').style.display = 'block';
+  // 加底部遮罩，点击关闭
+  if (!$('stickerBackdrop')) {
+    var bd = document.createElement('div'); bd.id = 'stickerBackdrop';
+    bd.style.cssText = 'position:fixed;inset:0;z-index:24;background:rgba(0,0,0,.3)';
+    bd.onclick = function() { $('stickerPanel').style.display = 'none'; bd.remove(); };
+    document.body.appendChild(bd);
+  }
   loadStickers('happy');
   renderStickerCats();
 };
-$('closeSticker').onclick = function() { $('stickerPanel').style.display = 'none'; };
+$('closeSticker').onclick = function() {
+  $('stickerPanel').style.display = 'none';
+  var bd = $('stickerBackdrop'); if (bd) bd.remove();
+};
 
 function renderStickerCats() {
   var cats = ['happy','cry','love','angry','surprise','shy'];
@@ -2258,13 +2268,8 @@ async function loadStickers(cat) {
 }
 
 function sendSticker(fname) {
-  var msg = document.createElement('div'); msg.className = 'msg msg-user';
-  var b = document.createElement('div'); b.className = 'msg-bubble bubble-user';
-  var img = document.createElement('img'); img.src = '/stickers/'+fname;
-  img.style.cssText = 'max-width:200px;max-height:200px;border-radius:12px;display:block';
-  b.append(img); msg.append(b);
-  $('stream').append(msg); msg.scrollIntoView({behavior:'smooth'});
   $('stickerPanel').style.display = 'none';
+  sendMessage('[Sticker] /stickers/' + fname, true);
 }
 
 $('stickerFileInput').onchange = async function() {
