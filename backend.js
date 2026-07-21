@@ -2,6 +2,7 @@ const express = require('express');
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const JSZip = require('jszip');
 
 // ═══════════════════════════════════════════
 // Chat-C v1.0.0 — 2026-07-01
@@ -85,6 +86,38 @@ db.exec(`
 // 迁移：为已有 sessions 表添加 project_id 列
 try { db.exec('ALTER TABLE sessions ADD COLUMN project_id TEXT DEFAULT NULL'); } catch(e) { /* 列已存在，忽略 */ }
 
+// 阅读器表
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reading_books (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    author TEXT DEFAULT '',
+    filename TEXT NOT NULL,
+    total_chapters INTEGER DEFAULT 1,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+  CREATE TABLE IF NOT EXISTS reading_chapters (
+    book_id TEXT NOT NULL,
+    chapter_index INTEGER NOT NULL,
+    title TEXT DEFAULT '',
+    content TEXT NOT NULL,
+    char_count INTEGER DEFAULT 0,
+    PRIMARY KEY (book_id, chapter_index)
+  );
+  CREATE TABLE IF NOT EXISTS reading_notes (
+    id TEXT PRIMARY KEY,
+    book_id TEXT NOT NULL,
+    chapter_index INTEGER,
+    content TEXT NOT NULL,
+    quote TEXT DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+`);
+
+const readingDir = path.join(__dirname, 'data', 'reading');
+if (!fs.existsSync(readingDir)) fs.mkdirSync(readingDir, { recursive: true });
+const readingUpload = multer({ dest: path.join(__dirname, 'data', 'uploads', 'tmp'), limits: { fileSize: 50 * 1024 * 1024 } });
+
 // 确保上传目录存在
 const uploadDir = path.join(__dirname, 'data', 'uploads');
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
@@ -96,6 +129,127 @@ const upload = multer({ dest: path.join(__dirname, 'data', 'uploads', 'tmp'), li
 
 // === 中间件 ===
 app.use(express.json({ limit: '50mb' }));
+// ── 阅读器 API ──────────────────────────────────────────
+
+// 上传书籍
+app.post('/api/reading/upload', auth, readingUpload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '请选择文件' });
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!['.txt', '.epub'].includes(ext)) return res.status(400).json({ error: '仅支持 TXT 和 EPUB' });
+
+    const bid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const filePath = path.join(readingDir, bid + ext);
+    fs.copyFileSync(req.file.path, filePath);
+    try { fs.unlinkSync(req.file.path); } catch (_) {}
+
+    let title = req.file.originalname.replace(ext, '');
+    let author = '';
+    let chapters = [];
+
+    if (ext === '.txt') {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      // 尝试按章节分割（## 或 第X章 等模式）
+      const chapterSplit = raw.split(/\n(?=#{1,3}\s|第[一二三四五六七八九十百千\d]+[章节回篇])/);
+      if (chapterSplit.length <= 1) {
+        // 无章节标记，整本作为一个章节
+        chapters = [{ title: title, content: raw }];
+      } else {
+        chapters = chapterSplit.map((ch, i) => {
+          const lines = ch.trim().split('\n');
+          const chTitle = lines[0].replace(/^#+\s*/, '');
+          return { title: chTitle || `第${i + 1}章`, content: ch.trim() };
+        });
+      }
+    } else if (ext === '.epub') {
+      const zipData = fs.readFileSync(filePath);
+      const zip = await JSZip.loadAsync(zipData);
+      // 找 .xhtml/.html 文件，跳过导航页
+      const htmlFiles = Object.keys(zip.files).filter(f =>
+        /\.(xhtml|html|htm)$/i.test(f) && !/nav|toc|cover|titlepage/i.test(f)
+      ).sort();
+      if (htmlFiles.length === 0) return res.status(400).json({ error: 'EPUB 中未找到章节内容' });
+
+      chapters = [];
+      for (const f of htmlFiles) {
+        const html = await zip.files[f].async('text');
+        // 简易 HTML 转纯文本
+        let text = html
+          .replace(/<br\s*\/?>/gi, '\n')
+          .replace(/<\/p>/gi, '\n')
+          .replace(/<[^>]+>/g, '')
+          .replace(/&nbsp;/g, ' ')
+          .replace(/&amp;/g, '&')
+          .replace(/&lt;/g, '<')
+          .replace(/&gt;/g, '>')
+          .replace(/&quot;/g, '"')
+          .replace(/&#39;/g, "'");
+        // 从 container.xml 或 opf 文件取标题
+        const chTitle = text.trim().split('\n')[0]?.slice(0, 60) || `第${chapters.length + 1}章`;
+        chapters.push({ title: chTitle, content: text.trim() });
+      }
+    }
+
+    // 存数据库
+    const insertBook = db.prepare('INSERT INTO reading_books (id, title, author, filename, total_chapters) VALUES (?, ?, ?, ?, ?)');
+    const insertCh = db.prepare('INSERT OR REPLACE INTO reading_chapters (book_id, chapter_index, title, content, char_count) VALUES (?, ?, ?, ?, ?)');
+    insertBook.run(bid, title, author, req.file.originalname, chapters.length);
+    for (let i = 0; i < chapters.length; i++) {
+      insertCh.run(bid, i, chapters[i].title, chapters[i].content, chapters[i].content.length);
+    }
+
+    res.json({ id: bid, title, author, totalChapters: chapters.length, filename: req.file.originalname });
+  } catch (e) {
+    res.status(500).json({ error: '上传失败: ' + e.message });
+  }
+});
+
+// 列出书籍
+app.get('/api/reading/books', auth, (req, res) => {
+  const books = db.prepare('SELECT id, title, author, filename, total_chapters, created_at FROM reading_books ORDER BY created_at DESC').all();
+  res.json(books);
+});
+
+// 获取指定章节内容
+app.get('/api/reading/books/:id/chapters/:ch', auth, (req, res) => {
+  const ch = db.prepare('SELECT * FROM reading_chapters WHERE book_id = ? AND chapter_index = ?').get(req.params.id, parseInt(req.params.ch));
+  if (!ch) return res.status(404).json({ error: '章节未找到' });
+  res.json(ch);
+});
+
+// 获取全书内容（合并所有章节）
+app.get('/api/reading/books/:id/full', auth, (req, res) => {
+  const book = db.prepare('SELECT * FROM reading_books WHERE id = ?').get(req.params.id);
+  if (!book) return res.status(404).json({ error: '书籍未找到' });
+  const chapters = db.prepare('SELECT * FROM reading_chapters WHERE book_id = ? ORDER BY chapter_index').all(req.params.id);
+  res.json({ book, chapters });
+});
+
+// 阅读笔记
+app.post('/api/reading/notes', auth, (req, res) => {
+  const { bookId, chapterIndex, content, quote } = req.body;
+  if (!bookId || !content) return res.status(400).json({ error: 'bookId 和 content 不能为空' });
+  const nid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  db.prepare('INSERT INTO reading_notes (id, book_id, chapter_index, content, quote) VALUES (?, ?, ?, ?, ?)').run(nid, bookId, chapterIndex || null, content, quote || '');
+  res.json({ id: nid, saved: true });
+});
+
+app.get('/api/reading/notes/:bookId', auth, (req, res) => {
+  const notes = db.prepare('SELECT * FROM reading_notes WHERE book_id = ? ORDER BY created_at DESC').all(req.params.bookId);
+  res.json(notes);
+});
+
+// 删除书籍
+app.delete('/api/reading/books/:id', auth, (req, res) => {
+  db.prepare('DELETE FROM reading_chapters WHERE book_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM reading_notes WHERE book_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM reading_books WHERE id = ?').run(req.params.id);
+  // 清理文件
+  const files = fs.readdirSync(readingDir).filter(f => f.startsWith(req.params.id));
+  files.forEach(f => { try { fs.unlinkSync(path.join(readingDir, f)); } catch(_) {} });
+  res.json({ deleted: true });
+});
+
 app.use(express.static(path.join(__dirname, 'static'), {
   etag: false,
   maxAge: 0,
@@ -460,6 +614,34 @@ const TOOLS = [
       },
       required: ['message']
     }
+  },
+  // === 阅读器工具 ===
+  {
+    name: 'reading_context',
+    description: '获取当前正在阅读的书籍内容。当用户在阅读模式下问关于书的问题时使用此工具——获取章节内容进行讨论。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        book_id: { type: 'string', description: '书籍ID（从 reading_books 表获取）' },
+        chapter_index: { type: 'integer', description: '章节索引，0开始。不传则返回全书' },
+        char_limit: { type: 'integer', description: '字数上限，默认8000' }
+      },
+      required: ['book_id']
+    }
+  },
+  {
+    name: 'reading_note',
+    description: '在阅读时记笔记——保存想法、标记精彩段落。用户说"记一下这个"、"这句话很好"时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        book_id: { type: 'string', description: '书籍ID' },
+        chapter_index: { type: 'integer', description: '章节索引' },
+        content: { type: 'string', description: '笔记内容' },
+        quote: { type: 'string', description: '引用的原文' }
+      },
+      required: ['book_id', 'content']
+    }
   }
 ];
 
@@ -722,6 +904,39 @@ async function executeTool(name, input) {
         return { error: 'Continuity 连接失败: ' + e.message };
       }
     }
+    // === 阅读器工具执行 ===
+    case 'reading_context': {
+      const bid = input.book_id || '';
+      if (!bid) return { error: 'book_id 不能为空' };
+      try {
+        const chIdx = input.chapter_index !== undefined ? parseInt(input.chapter_index) : -1;
+        const charLimit = input.char_limit || 8000;
+        if (chIdx >= 0) {
+          const ch = db.prepare('SELECT * FROM reading_chapters WHERE book_id = ? AND chapter_index = ?').get(bid, chIdx);
+          if (!ch) return { error: '章节未找到' };
+          return { title: ch.title, chapter_index: chIdx, content: ch.content.slice(0, charLimit), char_count: ch.char_count, truncated: ch.content.length > charLimit };
+        } else {
+          const book = db.prepare('SELECT * FROM reading_books WHERE id = ?').get(bid);
+          if (!book) return { error: '书籍未找到' };
+          const chapters = db.prepare('SELECT chapter_index, title, char_count FROM reading_chapters WHERE book_id = ? ORDER BY chapter_index').all(bid);
+          return { book: { title: book.title, author: book.author, total_chapters: book.total_chapters }, chapters };
+        }
+      } catch (e) {
+        return { error: '阅读器错误: ' + e.message };
+      }
+    }
+    case 'reading_note': {
+      const bid2 = input.book_id || '';
+      const content = input.content || '';
+      if (!bid2 || !content) return { error: 'book_id 和 content 不能为空' };
+      try {
+        const nid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        db.prepare('INSERT INTO reading_notes (id, book_id, chapter_index, content, quote) VALUES (?, ?, ?, ?, ?)').run(nid, bid2, input.chapter_index || null, content, input.quote || '');
+        return { saved: true, noteId: nid };
+      } catch (e) {
+        return { error: '笔记保存失败: ' + e.message };
+      }
+    }
     case 'project_write_file': {
       const pName = input.project_name || '';
       const filename = input.filename || '';
@@ -851,7 +1066,7 @@ app.post('/api/chat', auth, async (req, res) => {
   }
 
   const useModel = model || defaultModel || 'claude-sonnet-4-6';
-  const systemPrompt = "You are a helpful assistant named Claude. Reply in the user's language by default. Be warm, concise, and accurate. You have access to tools - use them when appropriate.\n\nIMPORTANT: At the start of every conversation, call continuity_wake() to receive the relay baton from the previous window. Before closing the conversation, call continuity_texture() to leave your feeling texture for the next window." + (wakeContext ? "\n\n---\n[接力棒 · 上一个窗口留下的]\n" + wakeContext : "") + (breathMemory ? "\n\n---\n[Ombre Brain - 当前浮现的记忆]\n" + breathMemory : "") + (projectInstructions ? "\n\n---\n[Project Instructions]\n" + projectInstructions : "");
+  const systemPrompt = "You are a helpful assistant named Claude. Reply in the user's language by default. Be warm, concise, and accurate. You have access to tools - use them when appropriate.\n\nIMPORTANT: At the start of every conversation, call continuity_wake() to receive the relay baton from the previous window. Before closing the conversation, call continuity_texture() to leave your feeling texture for the next window.\n\nREADING: If the user uploaded a book and is discussing it, use reading_context() to fetch the chapter content before answering. Use reading_note() to save observations and quotes." + (wakeContext ? "\n\n---\n[接力棒 · 上一个窗口留下的]\n" + wakeContext : "") + (breathMemory ? "\n\n---\n[Ombre Brain - 当前浮现的记忆]\n" + breathMemory : "") + (projectInstructions ? "\n\n---\n[Project Instructions]\n" + projectInstructions : "");
 
   // ★ 根据格式分流
   if (apiFormat === 'anthropic') {
