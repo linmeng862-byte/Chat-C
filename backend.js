@@ -114,8 +114,21 @@ db.exec(`
   );
 `);
 
+// 表情包表
+db.exec(`
+  CREATE TABLE IF NOT EXISTS stickers (
+    id TEXT PRIMARY KEY,
+    filename TEXT NOT NULL,
+    category TEXT DEFAULT '默认',
+    tags TEXT DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+`);
+
 const readingDir = path.join(__dirname, 'data', 'reading');
 if (!fs.existsSync(readingDir)) fs.mkdirSync(readingDir, { recursive: true });
+const stickerDir = path.join(__dirname, 'data', 'stickers');
+if (!fs.existsSync(stickerDir)) fs.mkdirSync(stickerDir, { recursive: true });
 
 // 确保上传目录存在
 const uploadDir = path.join(__dirname, 'data', 'uploads');
@@ -248,6 +261,58 @@ app.delete('/api/reading/books/:id', auth, (req, res) => {
   files.forEach(f => { try { fs.unlinkSync(path.join(readingDir, f)); } catch(_) {} });
   res.json({ deleted: true });
 });
+
+// ── 表情包 API ──────────────────────────────────────────
+const stickerUpload = multer({ dest: path.join(__dirname, 'data', 'uploads', 'tmp'), limits: { fileSize: 10 * 1024 * 1024 } });
+
+app.post('/api/stickers/upload', auth, stickerUpload.single('file'), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: '请选择图片' });
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    if (!['.png', '.jpg', '.jpeg', '.gif', '.webp'].includes(ext)) return res.status(400).json({ error: '仅支持 PNG/JPG/GIF/WEBP' });
+    const sid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const fname = sid + ext;
+    fs.copyFileSync(req.file.path, path.join(stickerDir, fname));
+    try { fs.unlinkSync(req.file.path); } catch(_) {}
+    const category = req.body.category || '默认';
+    const tags = req.body.tags || '';
+    db.prepare('INSERT INTO stickers (id, filename, category, tags) VALUES (?, ?, ?, ?)').run(sid, fname, category, tags);
+    res.json({ id: sid, filename: fname, category, tags });
+  } catch(e) {
+    res.status(500).json({ error: '上传失败: ' + e.message });
+  }
+});
+
+app.get('/api/stickers', (req, res) => {
+  const cat = req.query.category || '';
+  const search = req.query.q || '';
+  let stickers;
+  if (search) {
+    stickers = db.prepare("SELECT * FROM stickers WHERE tags LIKE ? OR category LIKE ? ORDER BY created_at DESC LIMIT 50").all('%'+search+'%', '%'+search+'%');
+  } else if (cat) {
+    stickers = db.prepare('SELECT * FROM stickers WHERE category = ? ORDER BY created_at DESC').all(cat);
+  } else {
+    stickers = db.prepare('SELECT * FROM stickers ORDER BY created_at DESC LIMIT 50').all();
+  }
+  res.json(stickers);
+});
+
+app.get('/api/stickers/categories', (req, res) => {
+  const cats = db.prepare('SELECT DISTINCT category FROM stickers ORDER BY category').all().map(r => r.category);
+  res.json(cats.length ? cats : ['默认']);
+});
+
+app.delete('/api/stickers/:id', auth, (req, res) => {
+  const s = db.prepare('SELECT * FROM stickers WHERE id = ?').get(req.params.id);
+  if (s) {
+    try { fs.unlinkSync(path.join(stickerDir, s.filename)); } catch(_) {}
+    db.prepare('DELETE FROM stickers WHERE id = ?').run(req.params.id);
+  }
+  res.json({ deleted: true });
+});
+
+// 图片静态服务
+app.use('/stickers', express.static(stickerDir, { maxAge: 86400000 }));
 
 app.use(express.static(path.join(__dirname, 'static'), {
   etag: false,
@@ -687,6 +752,18 @@ const TOOLS = [
       },
       required: ['prompt']
     }
+  },
+  {
+    name: 'send_sticker',
+    description: '发送一个表情包。根据对话情绪选择合适的分类——happy开心/cry难过/love爱/angry生气/surprise惊讶/shy害羞。用户说"发个表情""来点表情包""开心""哭了"时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        category: { type: 'string', description: '表情分类: happy, cry, love, angry, surprise, shy。根据当前对话情绪选择。' },
+        q: { type: 'string', description: '搜索关键词（可选），如"猫""狗""加油"' }
+      },
+      required: ['category']
+    }
   }
 ];
 
@@ -1025,6 +1102,24 @@ async function executeTool(name, input) {
         return { image_url: url, prompt, size };
       } catch (e) {
         return { error: '图片生成失败: ' + e.message };
+      }
+    }
+    case 'send_sticker': {
+      const cat = input.category || 'happy';
+      const search = input.q || '';
+      try {
+        let sticker;
+        if (search) {
+          sticker = db.prepare("SELECT * FROM stickers WHERE (category = ? OR tags LIKE ?) ORDER BY RANDOM() LIMIT 1").get(cat, '%' + search + '%');
+        } else {
+          sticker = db.prepare('SELECT * FROM stickers WHERE category = ? ORDER BY RANDOM() LIMIT 1').get(cat);
+        }
+        // fallback: 随便选一个
+        if (!sticker) sticker = db.prepare('SELECT * FROM stickers ORDER BY RANDOM() LIMIT 1').get();
+        if (!sticker) return { error: '表情包库是空的——先上传一些表情包吧！' };
+        return { sticker_url: '/stickers/' + sticker.filename, category: cat, tags: sticker.tags };
+      } catch(e) {
+        return { error: '表情包查找失败: ' + e.message };
       }
     }
     case 'project_write_file': {
