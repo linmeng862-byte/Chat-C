@@ -421,7 +421,17 @@ html[data-theme="dark"] .delete-confirm-popover,.rename-dialog{background:var(--
 <input id="drawerOmbrePassword" type="password" placeholder="Ombre Brain 密码" autocomplete="off" style="width:100%;padding:8px 12px;border:1px solid var(--bg-sunken);border-radius:12px;font:14px var(--font-sans);background:var(--bg-surface);color:var(--text-primary);margin-bottom:8px;outline:none">
 <button id="drawerOmbreSave" style="width:100%;padding:8px;border:1px solid var(--bg-sunken);border-radius:12px;font:500 14px var(--font-sans);background:var(--accent);color:#fff;cursor:pointer">保存</button>
 </div>
+<div id="drawerImageGenForm" style="display:none;padding:4px 0">
+<input id="drawerImageGenUrl" type="text" placeholder="Image Gen API URL (如 https://api.openai.com)" autocomplete="off" style="width:100%;padding:8px 12px;border:1px solid var(--bg-sunken);border-radius:12px;font:14px var(--font-sans);background:var(--bg-surface);color:var(--text-primary);margin-bottom:6px;outline:none">
+<input id="drawerImageGenKey" type="password" placeholder="Image Gen API Key" autocomplete="off" style="width:100%;padding:8px 12px;border:1px solid var(--bg-sunken);border-radius:12px;font:14px var(--font-sans);background:var(--bg-surface);color:var(--text-primary);margin-bottom:6px;outline:none">
+<button id="drawerImageGenSave" style="width:100%;padding:8px;border:1px solid var(--bg-sunken);border-radius:12px;font:500 14px var(--font-sans);background:var(--accent);color:#fff;cursor:pointer">保存</button>
+</div>
 </div></nav>
+    <div class="drawer-ombre-header" style="display:flex;align-items:center;gap:8px;padding:8px 0;cursor:pointer;margin-top:8px" onclick="var f=document.getElementById('drawerImageGenForm');f.style.display=f.style.display==='block'?'none':'block'">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="16" height="16"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+    <span style="flex:1;font:500 13px var(--font-sans);color:var(--text-secondary)">🎨 Image Gen</span>
+    <span style="font:11px var(--font-sans);color:var(--text-tertiary)" id="imageGenStatus">未配置</span>
+    </div>
     <div class="mobile-sidebar-section-title">Recents</div>
     <div class="drawer-list" id="sessionList"></div>
     <button class="mobile-sidebar-new-chat" id="drawerNewChat"><span>＋</span><span>New chat</span></button>
@@ -1836,6 +1846,31 @@ $('drawerOmbreSave').onclick = async function(){
       }
     }
   }catch(e){}
+})();
+
+// 🎨 Image Gen 配置
+$('drawerImageGenSave').onclick = async function(){
+  var url = document.getElementById('drawerImageGenUrl').value.trim();
+  var key = document.getElementById('drawerImageGenKey').value.trim();
+  if (!url || !key) { toast('请填写 Image Gen URL 和 Key'); return; }
+  try {
+    var r = await api('/api/auth/image-gen', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ base_url: url, api_key: key, model: 'dall-e-3' }) });
+    if (r.ok) {
+      document.getElementById('imageGenStatus').textContent = '已配置';
+      document.getElementById('imageGenStatus').style.color = 'var(--accent)';
+      toast('Image Gen 已配置！');
+    }
+  } catch(e) { toast('保存失败'); }
+};
+// 加载 Image Gen 配置
+(async function(){
+  try {
+    var r = await api('/api/auth/image-gen');
+    if (r.baseUrl) {
+      document.getElementById('imageGenStatus').textContent = '已配置';
+      document.getElementById('imageGenStatus').style.color = 'var(--accent)';
+    }
+  } catch(e) {}
 })();
 
 function saveApiConfig(){var baseURL=document.getElementById('drawerBaseURL').value.trim().replace(/\/+$/,'');var apiKey=document.getElementById('drawerApiKey').value.trim();var apiFormat=document.querySelector('input[name=api_format]:checked')?.value||'openai';var modelInput=document.getElementById('drawerModel').value.trim();if(!baseURL||!apiKey){var st=document.getElementById('drawerApiStatus');st.style.display='block';st.textContent='请填写完整';st.style.color='#e54d2e';return}var btn=document.getElementById('drawerApiSave');btn.textContent='验证中...';btn.disabled=true;fetch('/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({base_url:baseURL,api_key:apiKey,api_format:apiFormat,model:modelInput})}).then(function(r){if(!r.ok)throw Error('fail');return r.json()}).then(function(d){state.token=d.token;localStorage.setItem('chat_token',d.token);localStorage.setItem('chat_api_config',JSON.stringify({base_url:baseURL,api_key:apiKey,api_format:apiFormat,model:modelInput}));var st=document.getElementById('drawerApiStatus');st.style.display='block';st.textContent='\u2705 已连接';st.style.color='#16a34a';btn.textContent='保存配置';btn.disabled=false}).catch(function(){var st=document.getElementById('drawerApiStatus');st.style.display='block';st.textContent='\u274c 连接失败';st.style.color='#e54d2e';btn.textContent='保存配置';btn.disabled=false})}

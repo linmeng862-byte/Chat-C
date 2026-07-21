@@ -275,6 +275,19 @@ app.get('/api/auth/ombre', auth, (req, res) => {
   res.json({ configured: hasPassword, url: OMBRE_BRAIN_URL });
 });
 
+// 图片生成配置
+app.post('/api/auth/image-gen', auth, (req, res) => {
+  const { base_url, api_key, model } = req.body;
+  const upsert = db.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)');
+  if (base_url !== undefined) upsert.run('img_gen_url', base_url);
+  if (api_key !== undefined) upsert.run('img_gen_key', api_key);
+  if (model !== undefined) upsert.run('img_gen_model', model);
+  res.json({ ok: true });
+});
+app.get('/api/auth/image-gen', (req, res) => {
+  res.json(getImageGenConfig());
+});
+
 // === 认证 ===
 const AUTH_TOKEN = process.env.AUTH_TOKEN || 'claude-chat-' + Date.now().toString(36);
 
@@ -407,6 +420,14 @@ function getOmbreCookie() {
 }
 function setOmbreCookie(val) {
   db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('ombre_session', ?)").run(val);
+}
+
+function getImageGenConfig() {
+  return {
+    baseUrl: db.prepare("SELECT value FROM settings WHERE key = 'img_gen_url'").get()?.value || '',
+    apiKey: db.prepare("SELECT value FROM settings WHERE key = 'img_gen_key'").get()?.value || '',
+    model: db.prepare("SELECT value FROM settings WHERE key = 'img_gen_model'").get()?.value || 'dall-e-3',
+  };
 }
 
 // === 自定义工具定义 ===
@@ -640,6 +661,31 @@ const TOOLS = [
         quote: { type: 'string', description: '引用的原文' }
       },
       required: ['book_id', 'content']
+    }
+  },
+  {
+    name: 'create_artifact',
+    description: '创建一个文件/代码/文档。当用户说"写一个"、"生成一个文件"、"做一个HTML页面"时使用。内容支持markdown、html、代码。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        filename: { type: 'string', description: '文件名，如 index.html、app.py、README.md' },
+        content: { type: 'string', description: '文件内容' },
+        language: { type: 'string', description: '语言标记，如 html、python、javascript、markdown。用于语法高亮和预览' }
+      },
+      required: ['filename', 'content']
+    }
+  },
+  {
+    name: 'generate_image',
+    description: '生成图片。当用户说"画一张"、"生成一张图"、"帮我画"时使用。',
+    input_schema: {
+      type: 'object',
+      properties: {
+        prompt: { type: 'string', description: '图片描述（英文效果最好）' },
+        size: { type: 'string', description: '尺寸: square(1024x1024), landscape(1792x1024), portrait(1024x1792)，默认square' }
+      },
+      required: ['prompt']
     }
   }
 ];
@@ -934,6 +980,51 @@ async function executeTool(name, input) {
         return { saved: true, noteId: nid };
       } catch (e) {
         return { error: '笔记保存失败: ' + e.message };
+      }
+    }
+    case 'create_artifact': {
+      const fname = input.filename || 'untitled.txt';
+      const fcontent = input.content || '';
+      const lang = input.language || '';
+      try {
+        // 自动创建/使用 "Chat Artifacts" 项目
+        let proj = db.prepare("SELECT * FROM projects WHERE name = 'Chat Artifacts'").get();
+        if (!proj) {
+          const pid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+          db.prepare('INSERT INTO projects (id, name, description) VALUES (?, ?, ?)').run(pid, 'Chat Artifacts', 'AI 在聊天中创建的文件');
+          proj = { id: pid };
+        }
+        const fid = Date.now().toString(36) + Math.random().toString(36).slice(2);
+        db.prepare('INSERT INTO project_files (id, project_id, filename, content, size) VALUES (?, ?, ?, ?, ?)').run(fid, proj.id, fname, fcontent, Buffer.byteLength(fcontent));
+        // 同步磁盘
+        const pDir = path.join(projectDir, proj.id);
+        if (!fs.existsSync(pDir)) fs.mkdirSync(pDir, { recursive: true });
+        fs.writeFileSync(path.join(pDir, fname), fcontent, 'utf8');
+        return { artifact_id: fid, filename: fname, language: lang, size: fcontent.length, preview: 'Artifact created: ' + fname };
+      } catch (e) {
+        return { error: 'Artifact创建失败: ' + e.message };
+      }
+    }
+    case 'generate_image': {
+      const prompt = input.prompt || '';
+      if (!prompt) return { error: '描述不能为空' };
+      const size = input.size || 'square';
+      const imgConfig = getImageGenConfig();
+      if (!imgConfig.baseUrl || !imgConfig.apiKey) return { error: '图片生成未配置——请在设置中填写 Image Gen Base URL 和 API Key' };
+      try {
+        const sizes = { square: '1024x1024', landscape: '1792x1024', portrait: '1024x1792' };
+        const r = await fetch(imgConfig.baseUrl + '/v1/images/generations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + imgConfig.apiKey },
+          body: JSON.stringify({ model: imgConfig.model || 'dall-e-3', prompt, n: 1, size: sizes[size] || '1024x1024' })
+        });
+        const data = await r.json();
+        if (!r.ok) return { error: '图片生成失败: ' + (data.error?.message || r.status) };
+        const url = data.data?.[0]?.url || data.data?.[0]?.b64_json;
+        if (!url) return { error: '未返回图片' };
+        return { image_url: url, prompt, size };
+      } catch (e) {
+        return { error: '图片生成失败: ' + e.message };
       }
     }
     case 'project_write_file': {
