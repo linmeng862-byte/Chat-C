@@ -736,7 +736,7 @@ function _buildUserRow(text,timestamp='',attachments=[]){const row=document.crea
   if(imgs.length){const wrap=document.createElement('div');wrap.className='user-images';imgs.forEach(a=>{const img=document.createElement('img');img.className='user-image';img.alt=a.name||'';if(a.preview){img.src=a.preview}else{img._lazyAtt=a;lazyImgObserver.observe(img)}wrap.append(img)});row.append(wrap)}
   const b=document.createElement('div');b.className='bubble';
   if(files.length){const fc=document.createElement('div');fc.className='message-attachments';files.forEach(item=>fc.append(attachmentCard(item)));b.append(fc)}
-  if(text){const content=document.createElement('div');content.textContent=text;b.append(content);if(text.trim().length<=30){let _cpT=null;const _cpCancel=()=>{clearTimeout(_cpT);_cpT=null};b.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'&&e.button!==0)return;_cpCancel();_cpT=setTimeout(()=>{try{navigator.clipboard?.writeText?.(text);toast?.('已复制')}catch(e){}_cpT=null},550)});b.addEventListener('pointerup',_cpCancel);b.addEventListener('pointercancel',_cpCancel);b.addEventListener('pointermove',()=>{if(_cpT)_cpCancel()})}}
+  if(text){const content=document.createElement('div');renderMessage(content,text);b.append(content);if(text.trim().length<=30){let _cpT=null;const _cpCancel=()=>{clearTimeout(_cpT);_cpT=null};b.addEventListener('pointerdown',e=>{if(e.pointerType==='mouse'&&e.button!==0)return;_cpCancel();_cpT=setTimeout(()=>{try{navigator.clipboard?.writeText?.(text);toast?.('已复制')}catch(e){}_cpT=null},550)});b.addEventListener('pointerup',_cpCancel);b.addEventListener('pointercancel',_cpCancel);b.addEventListener('pointermove',()=>{if(_cpT)_cpCancel()})}}
   if(text||files.length)row.append(b);return row}
 function addUser(text,timestamp='',attachments=[]){const row=_buildUserRow(text,timestamp,attachments);streamInner.append(row);row.scrollIntoView({block:'end'});return row}
 function plainConversation(){return[...streamInner.children].map(x=>x.classList.contains('msg-user')?`You: ${x.dataset.raw}`:x.classList.contains('msg-claude')?`Claude: ${x.dataset.raw||''}`:'').filter(Boolean).join('\n\n')}
@@ -1379,6 +1379,7 @@ function beginClaude(userText,userAttachments=[]){document.querySelector('.strea
       traceRow.style.display='none';traceRow.before(btn);
     },
     finish(){
+      if(row.dataset.finished)return;row.dataset.finished='1';
       row.classList.remove('streaming');
       setPhase('complete');
       row.dataset.raw=raw;
