@@ -1427,6 +1427,8 @@ async function handleAnthropicChat(req, res, ctx) {
           });
 
           res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result, is_error: result.is_error || false}) + '\n\n');
+          // send_sticker: 实时推送图到前端
+          try { var ctt = typeof result === 'string' ? JSON.parse(result) : result; if (ctt && ctt.sticker_url) { res.write('event: sticker\ndata: ' + JSON.stringify({url: ctt.sticker_url}) + '\n\n'); } } catch (_) {}
         }
         
         // 把工具结果加到消息历史，再发请求
@@ -1502,10 +1504,21 @@ async function handleAnthropicChat(req, res, ctx) {
             }
           }
           
+          // 检查是否调用了 send_sticker——把图注入回复
+          let stickerImgs = '';
+          for (const tr of toolResults) {
+            try {
+              const ct = typeof tr.content === 'string' ? JSON.parse(tr.content) : tr.content;
+              if (ct && ct.sticker_url) {
+                stickerImgs += '\n![sticker](' + ct.sticker_url + ')';
+              }
+            } catch (_) {}
+          }
           // 保存第二次的助手回复
-          if (secondAssistantText) {
+          if (secondAssistantText || stickerImgs) {
+            const finalContent = (secondAssistantText || '') + stickerImgs;
             db.prepare('INSERT INTO messages (conv_id, role, content, thinking) VALUES (?, ?, ?, ?)')
-              .run(convId, 'assistant', secondAssistantText, secondThinkingText);
+              .run(convId, 'assistant', finalContent, secondThinkingText);
           }
         }
       }
@@ -1684,6 +1697,8 @@ async function handleOpenAIChat(req, res, ctx) {
           }
           toolResults.push({ id: tc.id, result });
           res.write('event: tool_result\ndata: ' + JSON.stringify({tool_use_id: tc.id, content: result, is_error: result.is_error || false}) + '\n\n');
+          // send_sticker: 实时推送图到前端
+          try { var ctt = typeof result === 'string' ? JSON.parse(result) : result; if (ctt && ctt.sticker_url) { res.write('event: sticker\ndata: ' + JSON.stringify({url: ctt.sticker_url}) + '\n\n'); } } catch (_) {}
         }
 
         // 构建 OpenAI 格式后续消息
